@@ -6,3 +6,9 @@
 /reports
 /.vs
 /data
+
+# Credentials folder — secrets and tenant configs must never be committed.
+# The README.md and .gitkeep inside are tracked; everything else is not.
+/credentials/*
+!/credentials/README.md
+!/credentials/.gitkeep

@@ -1,0 +1,10 @@
+{
+  "_comment": "Maps environment IDs to their designated owners. Auto-populated from Environment Admin role assignments during collection. You can manually override or add entries. The report displays owner info per environment.",
+  "_example": {
+    "00000000-0000-0000-0000-000000000000": {
+      "Owner": "admin@contoso.com",
+      "Team": "Platform Engineering",
+      "Notes": "Primary CRM environment"
+    }
+  }
+}

@@ -218,38 +218,398 @@ function Collect-FOEnvironmentData {
     }
 
     # ── 6. FO Cleanup Batch Jobs (well-known names) ───────────────────────────
-    # Look for standard FO cleanup jobs that should be scheduled
+    # Check for standard FO cleanup jobs that should be scheduled.
+    # Each entry includes the menu path and batch class so admins know exactly
+    # where to set up any missing jobs.
     Write-InventoryLog '    [FO: Checking standard cleanup batch jobs]...' -Indent 2
     if ($batchJobs) {
         $bjArr = @($batchJobs)
-        $knownCleanupJobs = @(
-            @{ Pattern = '*Cleanup*session*';          Purpose = 'Session cleanup'          },
-            @{ Pattern = '*Cleanup*staging*';          Purpose = 'DIXF staging cleanup'     },
-            @{ Pattern = '*Delete old*batch*';         Purpose = 'Old batch job cleanup'    },
-            @{ Pattern = '*SysEmailBatchFlush*';       Purpose = 'Email batch flush'        },
-            @{ Pattern = '*Inventory value report*';   Purpose = 'Inventory report cleanup' },
-            @{ Pattern = '*InventSumDeltaUpdateFix*';  Purpose = 'Inventory sum fix'        },
-            @{ Pattern = '*RetailConnScheduler*';      Purpose = 'Retail channel scheduler' }
+
+        # Core: always applicable regardless of modules in use
+        $knownCleanupJobsCore = @(
+            # ── System / Batch History ─────────────────────────────────────────
+            @{
+                Pattern    = '*Batch job history clean-up*'
+                Purpose    = 'Batch job history cleanup'
+                Category   = 'System'
+                MenuPath   = 'System administration > Periodic tasks > Batch job history clean-up'
+                BatchClass = 'SysBatchHistoryCleanUp'
+                Notes      = 'Cleans BatchJobHistory, BatchHistory, BatchConstraintHistory. Recommended: 180-day retention, run daily or weekly outside business hours. For large tables (500k+ records / >75% of table) the stored procedure SysTruncateBatchHistory is used automatically.'
+            },
+            @{
+                Pattern    = '*Batch job clean-up*'
+                Purpose    = 'Batch job cleanup (accumulated/abandoned jobs)'
+                Category   = 'System'
+                MenuPath   = 'System administration > Periodic tasks > Batch job clean-up'
+                BatchClass = 'SysBatchJobCleanUp'
+                Notes      = 'Available from v10.0.39 (Platform update 63). Removes abandoned or unused batch job records. Filter by status (Withhold/Error/Finished/Canceled), caption, or class name.'
+            },
+            @{
+                Pattern    = '*Notification clean up*'
+                Purpose    = 'Alert and notification cleanup'
+                Category   = 'System'
+                MenuPath   = 'System administration > Periodic tasks > Notification clean up'
+                BatchClass = ''
+                Notes      = 'Cleans EventInbox and EventInboxData tables. Recommended: weekly. If alerts are not used, disable the batch job entirely.'
+            },
+            @{
+                Pattern    = '*Clean up log*'
+                Purpose    = 'Database log (audit trail) cleanup'
+                Category   = 'System'
+                MenuPath   = 'System administration > Inquiries > Database > Database Log > Clean up log'
+                BatchClass = ''
+                Notes      = 'Cleans SysDatabaseLog table. Grows extremely rapidly depending on configuration. Recommended: weekly or monthly. Example filter: retain 1 year of entries. Records for electronically signed items cannot be deleted.'
+            },
+            @{
+                Pattern    = '*Job history cleanup*'
+                Purpose    = 'DIXF execution history and staging cleanup'
+                Category   = 'DIXF'
+                MenuPath   = 'Data management workspace > Job history cleanup'
+                BatchClass = 'DMFExecutionHistoryCleanup'
+                Notes      = 'Cleans all staging tables, DMFSTAGINGVALIDATIONLOG, DMFSTAGINGLOG, DMFDEFINITIONGROUPEXECUTIONHISTORY, and related tables. Recommended: at least once per day. Default auto-cleanup at 90 days (since Sept 2023). Configure retention days and max execution hours.'
+            },
+            @{
+                Pattern    = '*Staging clean*'
+                Purpose    = 'DIXF staging cleanup (legacy name)'
+                Category   = 'DIXF'
+                MenuPath   = 'Data management workspace > Job history cleanup'
+                BatchClass = 'DMFExecutionHistoryCleanup'
+                Notes      = 'Older batch job name for DIXF staging cleanup. In current environments this job is named "Job history cleanup".'
+            },
+            @{
+                Pattern    = '*Clean up session*'
+                Purpose    = 'User session cleanup'
+                Category   = 'System'
+                MenuPath   = 'System administration > Periodic tasks > Clean up sessions'
+                BatchClass = 'SysUserSessionCleanup'
+                Notes      = 'Removes stale user session records from the database.'
+            },
+            @{
+                Pattern    = '*SysEmailBatchFlush*'
+                Purpose    = 'Email batch flush'
+                Category   = 'System'
+                MenuPath   = 'System administration > Periodic tasks > Email > Email distributor batch'
+                BatchClass = 'SysEmailBatchFlush'
+                Notes      = 'Processes and flushes the outbound email queue. Required for email delivery from D365FO.'
+            }
         )
+
+        # Sales & Marketing
+        $knownCleanupJobsSales = @(
+            @{
+                Pattern    = '*Sales update history cleanup*'
+                Purpose    = 'Sales update history cleanup'
+                Category   = 'Sales'
+                MenuPath   = 'Sales and marketing > Periodic tasks > Clean up > Sales update history cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans SalesParmTable, SalesParmUpdate, SalesParmLine, SalesParmSubLine for posted confirmations, picking lists, packing slips, and invoices. Run after Delete sales orders/quotations/return orders. Recommended: annually.'
+            },
+            @{
+                Pattern    = '*Delete*sales order*'
+                Purpose    = 'Delete old sales orders'
+                Category   = 'Sales'
+                MenuPath   = 'Sales and marketing > Periodic tasks > Clean up > Delete orders'
+                BatchClass = ''
+                Notes      = 'Deletes posted sales order headers and lines older than threshold. Process in batches under 5,000 records to avoid locking. Run before Sales update history cleanup.'
+            },
+            @{
+                Pattern    = '*Delete*quotation*'
+                Purpose    = 'Delete old sales quotations'
+                Category   = 'Sales'
+                MenuPath   = 'Sales and marketing > Periodic tasks > Clean up > Delete quotations'
+                BatchClass = ''
+                Notes      = 'Deletes old sales quotation headers and lines. Run before Sales update history cleanup.'
+            },
+            @{
+                Pattern    = '*Delete*return order*'
+                Purpose    = 'Delete old return orders'
+                Category   = 'Sales'
+                MenuPath   = 'Sales and marketing > Periodic tasks > Clean up > Delete return orders'
+                BatchClass = ''
+                Notes      = 'Deletes return order headers and lines. Run before Sales update history cleanup.'
+            },
+            @{
+                Pattern    = '*Order events cleanup*'
+                Purpose    = 'Order events cleanup'
+                Category   = 'Sales'
+                MenuPath   = 'Sales and marketing > Periodic tasks > Clean up > Order events cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans order event records. After running, review Order event setup and disable any unneeded event tracking checkboxes.'
+            }
+        )
+
+        # Procurement
+        $knownCleanupJobsProcurement = @(
+            @{
+                Pattern    = '*Purchase update history cleanup*'
+                Purpose    = 'Purchase update history cleanup'
+                Category   = 'Procurement'
+                MenuPath   = 'Procurement and sourcing > Periodic tasks > Clean up > Purchase update history cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans purchase order update history for confirmations, product receipts, and invoices. Mirrors the sales update history cleanup. Recommended: annually.'
+            }
+        )
+
+        # Warehouse Management
+        $knownCleanupJobsWarehouse = @(
+            @{
+                Pattern    = '*Work creation history cleanup*'
+                Purpose    = 'Work creation history cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Work creation history cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSWorkCreateHistory table. Parameter: days to keep (recommend 90-365 depending on warehouse volume). Reduces storage and simplifies upgrades.'
+            },
+            @{
+                Pattern    = '*Wave batch cleanup*'
+                Purpose    = 'Wave batch cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Wave batch cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans BatchJobHistory entries for wave batch group and WHSWaveTableBatch (wave-batch transaction) records.'
+            },
+            @{
+                Pattern    = '*Wave processing history log cleanup*'
+                Purpose    = 'Wave processing history log cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Wave processing history log cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSWaveExecutionHistory table. Parameter: days to keep.'
+            },
+            @{
+                Pattern    = '*Containerization history cleanup*'
+                Purpose    = 'Containerization history cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Containerization history cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSContainerizationHistory table. Parameter: days to keep (0 purges all records).'
+            },
+            @{
+                Pattern    = '*Mobile device activity log cleanup*'
+                Purpose    = 'Mobile device activity log cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Mobile device activity log cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSMobileDeviceActivityLog table (production order starts, driver check-ins/outs, LP removals). Parameter: days to keep. Recommended: weekly (weekends).'
+            },
+            @{
+                Pattern    = '*Work user session log cleanup*'
+                Purpose    = 'Work user session log cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Work user session log cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSWorkUserSessionLog table. Parameter unit is HOURS (not days). Recommended: daily or weekly.'
+            },
+            @{
+                Pattern    = '*Cycle count plan cleanup*'
+                Purpose    = 'Cycle count plan cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Cycle count plan cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSCycleCountPlanOverview records without planned recurrence, and their associated batch jobs and history. Primary benefit: reduces batch job history size.'
+            },
+            @{
+                Pattern    = '*Wave labels cleanup*'
+                Purpose    = 'Wave labels cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Wave labels cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSWaveLabel table. Parameter: days to keep.'
+            },
+            @{
+                Pattern    = '*Work line history log cleanup*'
+                Purpose    = 'Work line history log cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Work line history log cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans WHSTmpWorkLineHistory table. Parameter: days to keep.'
+            },
+            @{
+                Pattern    = '*License plate registration history*'
+                Purpose    = 'License plate registration history cleanup'
+                Category   = 'Warehouse'
+                MenuPath   = 'Warehouse management > Periodic tasks > Clean up > Clean up License plate registration history'
+                BatchClass = ''
+                Notes      = 'Cleans WHSLicensePlateReceivingHistory table. Parameter: days to keep.'
+            }
+        )
+
+        # Inventory Management
+        $knownCleanupJobsInventory = @(
+            @{
+                Pattern    = '*On-hand entries cleanup*'
+                Purpose    = 'On-hand entries cleanup (InventSum)'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > On-hand entries cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans InventSum table for zero-quantity tracking-dimension entries. Default: 7-day retention. Run in batch outside business hours. Note: may remove data used by Physical inventory by inventory dimension report.'
+            },
+            @{
+                Pattern    = '*Warehouse management on-hand entries cleanup*'
+                Purpose    = 'WMS on-hand entries cleanup (InventSum + WHSInventReserve)'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > Warehouse management on-hand entries cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans InventSum and WHSInventReserve for WMS-enabled items at zero value. Commits in batches of 100. Mandatory "max execution hours" parameter from v10.0.32+. Significantly improves on-hand calculation performance.'
+            },
+            @{
+                Pattern    = '*Inventory dimensions cleanup*'
+                Purpose    = 'Inventory dimensions cleanup (InventDim)'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > Inventory dimensions cleanup'
+                BatchClass = ''
+                Notes      = 'Permanently deletes unused InventDim records. WARNING: no alert or database log created. Only run with good reason and outside business hours.'
+            },
+            @{
+                Pattern    = '*Inventory settlements cleanup*'
+                Purpose    = 'Inventory settlements cleanup'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > Inventory settlements cleanup'
+                BatchClass = ''
+                Notes      = 'Groups closed and deletes canceled inventory settlements. Do not run close to fiscal year-end. Resource-intensive; run during low-usage periods.'
+            },
+            @{
+                Pattern    = '*Inventory journal*cleanup*'
+                Purpose    = 'Inventory journals cleanup'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > Inventory journals cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans posted inventory journals. Resource-intensive; run per company sequentially during low-usage periods.'
+            },
+            @{
+                Pattern    = '*Transfer order update history cleanup*'
+                Purpose    = 'Transfer order update history cleanup'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > Transfer order update history cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans InventTransferParmTable, InventTransferParmUpdate, and InventTransferParmLine tables created when posting transfer orders.'
+            },
+            @{
+                Pattern    = '*Inventory*report*clean*'
+                Purpose    = 'Inventory on-hand report storage cleanup'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up > Inventory on-hand report data clean up'
+                BatchClass = ''
+                Notes      = 'Cleans stored on-hand report output data. Parameter: delete reports executed before specified date.'
+            },
+            @{
+                Pattern    = '*InventSumDeltaUpdateFix*'
+                Purpose    = 'Inventory sum delta update fix'
+                Category   = 'Inventory'
+                MenuPath   = 'Inventory management > Periodic tasks > Clean up'
+                BatchClass = 'InventSumDeltaUpdateFix'
+                Notes      = 'Corrects InventSum delta update records. Run if inventory on-hand discrepancies are observed.'
+            }
+        )
+
+        # Production & Cost Management
+        $knownCleanupJobsProduction = @(
+            @{
+                Pattern    = '*Production journals cleanup*'
+                Purpose    = 'Production journals cleanup'
+                Category   = 'Production'
+                MenuPath   = 'Production control > Periodic tasks > Clean up > Production journals cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans unused production journals.'
+            },
+            @{
+                Pattern    = '*Production orders cleanup*'
+                Purpose    = 'Production orders cleanup (ended orders)'
+                Category   = 'Production'
+                MenuPath   = 'Production control > Periodic tasks > Clean up > Production orders cleanup'
+                BatchClass = ''
+                Notes      = 'Cleans ended production orders. Also accessible from Cost management > Manufacturing accounting > Clean up > Production orders cleanup.'
+            }
+        )
+
+        # Master Planning
+        $knownCleanupJobsMRP = @(
+            @{
+                Pattern    = '*Plan version cleanup*'
+                Purpose    = 'Master plan version cleanup'
+                Category   = 'Master Planning'
+                MenuPath   = 'Master planning > Master planning > Maintain plans > Plan version cleanup'
+                BatchClass = ''
+                Notes      = 'Removes orphaned master planning data and old plan versions. Automatic cleanup can malfunction leaving orphan data that slows queries. Recommended: monthly, never while MRP is running.'
+            }
+        )
+
+        # Finance / General Ledger
+        $knownCleanupJobsFinance = @(
+            @{
+                Pattern    = '*Clean up ledger journals*'
+                Purpose    = 'Ledger journals cleanup (GL/AR/AP posted journals)'
+                Category   = 'Finance'
+                MenuPath   = 'General ledger > Periodic tasks > Clean up ledger journals'
+                BatchClass = ''
+                Notes      = 'Permanently deletes posted GL, AR, and AP journal headers, lines, and attachments. WARNING: no reversal possible after deletion. Recommended: annually after year-close and reconciliation. v10.0.47+ includes batch performance improvement feature.'
+            }
+        )
+
+        # Retail / Commerce (only relevant if Commerce module is in use)
+        $knownCleanupJobsRetail = @(
+            @{
+                Pattern    = '*RetailConnScheduler*'
+                Purpose    = 'Retail channel scheduler'
+                Category   = 'Retail'
+                MenuPath   = 'Retail and Commerce > Retail and Commerce IT > Distribution schedule'
+                BatchClass = 'RetailConnScheduler'
+                Notes      = 'Required for Retail/Commerce implementations. Manages channel data synchronization to POS and e-commerce.'
+            },
+            @{
+                Pattern    = '*Clean up email notification logs*'
+                Purpose    = 'Email notification log cleanup (Retail/Commerce)'
+                Category   = 'Retail'
+                MenuPath   = 'Retail and Commerce > Retail and Commerce IT > Email and notifications > Clean up email notification logs'
+                BatchClass = ''
+                Notes      = 'Cleans email notification log records. Retail and Commerce module only.'
+            }
+        )
+
+        # Combine all categories
+        $knownCleanupJobs = $knownCleanupJobsCore +
+                            $knownCleanupJobsSales +
+                            $knownCleanupJobsProcurement +
+                            $knownCleanupJobsWarehouse +
+                            $knownCleanupJobsInventory +
+                            $knownCleanupJobsProduction +
+                            $knownCleanupJobsMRP +
+                            $knownCleanupJobsFinance +
+                            $knownCleanupJobsRetail
 
         $missingCleanup = [System.Collections.Generic.List[hashtable]]::new()
         foreach ($cj in $knownCleanupJobs) {
             $found = $bjArr | Where-Object { $_.Description -like $cj.Pattern }
             if (-not $found) {
-                $missingCleanup.Add(@{ Pattern = $cj.Pattern; Purpose = $cj.Purpose })
+                $missingCleanup.Add(@{
+                    Pattern    = $cj.Pattern
+                    Purpose    = $cj.Purpose
+                    Category   = $cj.Category
+                    MenuPath   = $cj.MenuPath
+                    BatchClass = $cj.BatchClass
+                    Notes      = $cj.Notes
+                })
             }
         }
 
+        # Group missing jobs by category for easier reporting
+        $missingByCategory = $missingCleanup | Group-Object Category | ForEach-Object {
+            [PSCustomObject]@{ Category = $_.Name; Count = $_.Count; Jobs = @($_.Group) }
+        } | Sort-Object Category
+
         $result.Sections['FOCleanupJobs'] = @{
+            TotalChecked        = $knownCleanupJobs.Count
+            MissingCount        = $missingCleanup.Count
             MissingStandardJobs = @($missingCleanup)
+            MissingByCategory   = @($missingByCategory)
             Notes               = @(
                 if ($missingCleanup.Count -gt 0) {
-                    "FO_MISSING_CLEANUP_JOBS ($($missingCleanup.Count) standard jobs not found)"
+                    "FO_MISSING_CLEANUP_JOBS ($($missingCleanup.Count) of $($knownCleanupJobs.Count) standard jobs not found)"
                 }
             ) | Where-Object { $_ }
         }
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-missing-cleanup-jobs.json' -Data $missingCleanup
-        Write-InventoryLog "    -> $($missingCleanup.Count) standard cleanup jobs not found." -Level OK -Indent 3
+        Write-InventoryLog "    -> $($missingCleanup.Count) of $($knownCleanupJobs.Count) standard cleanup jobs not found." -Level OK -Indent 3
     }
 
     # ── 7. FO Legal Entities ──────────────────────────────────────────────────

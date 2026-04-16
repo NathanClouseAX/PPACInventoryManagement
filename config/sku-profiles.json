@@ -1,0 +1,79 @@
+{
+  "_comment": "Per-SKU baseline expectations. Flags listed in 'Suppress' are downgraded to Info severity for that SKU. Flags in 'Require' are escalated to Critical if missing. Edit to match your organization's governance posture.",
+  "Production": {
+    "Suppress": [],
+    "Require": [
+      "AuditRequired",
+      "RetentionPolicyRequired",
+      "DuplicateDetectionRequired",
+      "ManagedEnvironmentRequired",
+      "BulkDeleteRequired"
+    ],
+    "GovernanceWeight": 3,
+    "_comment": "Production environments are weighted 3x in tenant governance score"
+  },
+  "Sandbox": {
+    "Suppress": [
+      "NO_RETENTION_POLICIES",
+      "NO_DUPLICATE_DETECTION_RULES",
+      "AUDIT_DISABLED_OR_NO_ACTIVITY",
+      "NO_AUDIT_ACTIVITY_90D",
+      "NOT_IN_ENVIRONMENT_GROUP"
+    ],
+    "Require": [
+      "BulkDeleteRequired"
+    ],
+    "GovernanceWeight": 1.5,
+    "_comment": "Sandbox environments carry moderate weight"
+  },
+  "Developer": {
+    "Suppress": [
+      "NO_RETENTION_POLICIES",
+      "NO_DUPLICATE_DETECTION_RULES",
+      "AUDIT_DISABLED_OR_NO_ACTIVITY",
+      "NO_AUDIT_ACTIVITY_90D",
+      "NO_ACTIVE_USERS",
+      "NO_MANAGED_SOLUTIONS",
+      "NOT_IN_ENVIRONMENT_GROUP",
+      "PRODUCTION_NOT_MANAGED_ENVIRONMENT",
+      "NO_DEDICATED_ENVIRONMENT_ADMIN",
+      "NO_MAILBOXES_CONFIGURED",
+      "MAILBOXES_NOT_TESTED",
+      "HIGH_UNMANAGED_SOLUTIONS",
+      "MANY_INACTIVE_WORKFLOWS",
+      "MANY_INACTIVE_PLUGIN_STEPS"
+    ],
+    "Require": [],
+    "GovernanceWeight": 0.5,
+    "_comment": "Developer environments are expected to have fewer controls"
+  },
+  "Trial": {
+    "Suppress": [
+      "NO_RETENTION_POLICIES",
+      "NO_DUPLICATE_DETECTION_RULES",
+      "AUDIT_DISABLED_OR_NO_ACTIVITY",
+      "NO_AUDIT_ACTIVITY_90D",
+      "NO_ACTIVE_USERS",
+      "NO_MANAGED_SOLUTIONS",
+      "NOT_IN_ENVIRONMENT_GROUP",
+      "PRODUCTION_NOT_MANAGED_ENVIRONMENT",
+      "NO_DEDICATED_ENVIRONMENT_ADMIN",
+      "NO_MAILBOXES_CONFIGURED",
+      "MAILBOXES_NOT_TESTED"
+    ],
+    "Require": [],
+    "GovernanceWeight": 0.25,
+    "_comment": "Trial environments are ephemeral - minimal governance expectations"
+  },
+  "Default": {
+    "Suppress": [
+      "NO_MANAGED_SOLUTIONS",
+      "NO_DUPLICATE_DETECTION_RULES"
+    ],
+    "Require": [
+      "BulkDeleteRequired"
+    ],
+    "GovernanceWeight": 2,
+    "_comment": "Default environment is shared across the tenant - moderate governance expected"
+  }
+}

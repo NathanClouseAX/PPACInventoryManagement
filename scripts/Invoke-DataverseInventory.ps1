@@ -218,12 +218,14 @@ foreach ($env in $environments) {
     Write-InventoryLog "  ID: $envId" -Indent 1
     Write-InventoryLog "  State: $($env.State) | Runtime: $($env.RuntimeState)" -Indent 1
 
-    # Resume support: skip if already collected and not Force
+    # Resume support: if ce-summary.json already exists and -Force was not specified,
+    # skip re-collection to allow resuming an interrupted run. We still load the
+    # existing summary so it appears correctly in the final report and delta comparison.
     $ceSummaryFile = Join-Path $envOutputDir 'ce-summary.json'
     if (-not $Force -and (Test-Path $ceSummaryFile)) {
         Write-InventoryLog "  Already collected (use -Force to overwrite). Skipping." -Level SKIP -Indent 1
         $skippedCount++
-        # Still load the summary for the report
+        # Re-hydrate just enough fields for the report (storage comes from live env list, not cached summary)
         try {
             $existingCE = Get-Content $ceSummaryFile -Raw | ConvertFrom-Json
             $envEntry = @{
@@ -233,7 +235,7 @@ foreach ($env in $environments) {
                 IsDefault        = $env.IsDefault
                 State            = $env.State
                 Location         = $env.Location
-                StorageDB_MB     = $env.StorageDB_MB
+                StorageDB_MB     = $env.StorageDB_MB     # Always from live BAP data (most current)
                 StorageFile_MB   = $env.StorageFile_MB
                 StorageLog_MB    = $env.StorageLog_MB
                 StorageTotal_MB  = $env.StorageTotal_MB
@@ -261,6 +263,10 @@ foreach ($env in $environments) {
     # Save environment metadata
     Save-EnvironmentData -EnvironmentDir $envOutputDir -FileName 'metadata.json' -Data $env
 
+    # Build the per-environment summary entry that flows into master-summary.json
+    # and is read by Generate-Report.ps1. Fields come from both the BAP environment
+    # list (storage, metadata) and the CE/FO collectors (HasFO, AllFlags).
+    # GovernanceWeight, governance flags, and Admins are added below after collection.
     $envSummaryEntry = @{
         EnvironmentId   = $envId
         DisplayName     = $displayName
@@ -274,11 +280,66 @@ foreach ($env in $environments) {
         StorageLog_MB   = $env.StorageLog_MB
         StorageTotal_MB = $env.StorageTotal_MB
         HasDataverse    = $env.HasDataverse
-        HasFO           = $false
-        AllFlags        = @()
+        HasFO           = $false   # Overwritten by CE collector if FO solutions detected
+        AllFlags        = @()      # Merged from: CE flags + FO flags + BAP governance flags
         OutputDir       = $envOutputDir
         Skipped         = $false
         Error           = $null
+    }
+
+    # ── Environment Governance Checks (BAP metadata) ─────────────────────
+    # These apply to all environments regardless of Dataverse presence
+    $envFlags = [System.Collections.Generic.List[string]]::new()
+
+    # Item 15: Managed Environments status
+    $protLevel = $null
+    try { $protLevel = $env.RawProperties.governanceConfiguration.protectionLevel } catch {}
+    if ($env.EnvironmentSku -in 'Production','Sandbox' -and $protLevel -ne 'Protected') {
+        $envFlags.Add("PRODUCTION_NOT_MANAGED_ENVIRONMENT ($($env.EnvironmentSku) environment is not a Managed Environment - governance policies and extended features unavailable)")
+    }
+
+    # Item 16: Environment Group membership
+    $envGroupId = $null
+    try { $envGroupId = $env.RawProperties.environmentGroupId } catch {}
+    if ($env.EnvironmentSku -in 'Production','Sandbox' -and -not $envGroupId) {
+        $envFlags.Add("NOT_IN_ENVIRONMENT_GROUP ($($env.EnvironmentSku) environment not assigned to any Environment Group - cannot inherit policies or be managed in bulk)")
+    }
+
+    # Item 14: Environment Admin Assignments
+    try {
+        $roleResp = Invoke-BAPRequest `
+            -Path "/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/$envId/roleAssignments" `
+            -ApiVersion '2022-03-01-preview' `
+            -TimeoutSec 30
+        $roleAssignments = if ($roleResp.value) { $roleResp.value } else { @() }
+        Save-EnvironmentData -EnvironmentDir $envOutputDir -FileName 'role-assignments.json' -Data $roleAssignments
+
+        $envAdmins = @($roleAssignments | Where-Object {
+            $_.properties.roleDefinition.displayName -match 'Admin' -or
+            $_.properties.roleDefinition.id -match 'admin'
+        })
+        $userAdmins  = @($envAdmins | Where-Object { $_.properties.principal.type -eq 'User' })
+        $groupAdmins = @($envAdmins | Where-Object { $_.properties.principal.type -eq 'Group' })
+
+        if ($envAdmins.Count -eq 0 -and $env.EnvironmentSku -in 'Production','Sandbox') {
+            $envFlags.Add("NO_DEDICATED_ENVIRONMENT_ADMIN (no users or groups explicitly assigned as Environment Admin - relying solely on tenant-wide admin roles)")
+        }
+        if ($userAdmins.Count -gt 0 -and $groupAdmins.Count -eq 0 -and $env.EnvironmentSku -eq 'Production') {
+            $envFlags.Add("ENVIRONMENT_ADMIN_IS_USER_NOT_GROUP ($($userAdmins.Count) individual user admin assignments on Production - group-based assignment preferred for continuity)")
+        }
+
+        # Auto-populate owners from admin assignments
+        if ($envAdmins.Count -gt 0) {
+            $adminNames = @($envAdmins | ForEach-Object {
+                $p = $_.properties.principal
+                if ($p.displayName) { $p.displayName } elseif ($p.email) { $p.email } else { $p.id }
+            } | Select-Object -First 5)
+            $envSummaryEntry['Admins'] = $adminNames
+        }
+
+        Write-InventoryLog "  Admins: $($envAdmins.Count) ($($userAdmins.Count) users, $($groupAdmins.Count) groups)" -Level OK -Indent 1
+    } catch {
+        Write-InventoryLog "  Role assignments query failed: $_" -Level WARN -Indent 1
     }
 
     try {
@@ -318,6 +379,13 @@ foreach ($env in $environments) {
             Write-InventoryLog "  No FO solutions detected - FO collection skipped." -Level SKIP -Indent 1
         }
 
+        # ── Merge environment-level governance flags ──────────────────────
+        if ($envFlags.Count -gt 0) {
+            $envSummaryEntry.AllFlags = @(
+                @($envSummaryEntry.AllFlags) + @($envFlags) | Sort-Object -Unique
+            )
+        }
+
         $processedCount++
         Write-InventoryLog "  Done. Flags: $($envSummaryEntry.AllFlags.Count) | Storage: $($env.StorageTotal_MB) MB" -Level OK -Indent 1
 
@@ -330,7 +398,10 @@ foreach ($env in $environments) {
     $processSummary.Add($envSummaryEntry)
     $totalFlags.AddRange([string[]]$envSummaryEntry.AllFlags)
 
-    # Mild pacing to avoid rate limiting on large tenants
+    # Mild pacing: every 10 environments, pause briefly to reduce the risk of
+    # hitting BAP or Dataverse rate limits on large tenants (>50 environments).
+    # The 500ms pause is intentionally short - the token cache and retry backoff
+    # handle actual 429s, so this is just a courtesy delay.
     if ($envIdx % 10 -eq 0) { Start-Sleep -Milliseconds 500 }
 }
 
@@ -353,6 +424,70 @@ $masterSummary = @{
 }
 
 Save-RootData -FileName 'master-summary.json' -Data $masterSummary
+
+# ── Save run history snapshot for delta reporting ─────────────────────────────
+$runHistoryDir = Join-Path $OutputPath 'run-history'
+$null = New-Item -ItemType Directory -Path $runHistoryDir -Force
+$runTs = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+$runSnapshot = @{
+    RunAt     = $masterSummary.RunAt
+    TenantId  = $masterSummary.TenantId
+    Environments = @($processSummary | ForEach-Object {
+        @{
+            EnvironmentId   = $_.EnvironmentId
+            DisplayName     = $_.DisplayName
+            EnvironmentSku  = $_.EnvironmentSku
+            StorageDB_MB    = $_.StorageDB_MB
+            StorageFile_MB  = $_.StorageFile_MB
+            StorageLog_MB   = $_.StorageLog_MB
+            StorageTotal_MB = $_.StorageTotal_MB
+            AllFlags        = @($_.AllFlags)
+            Admins          = if ($_.Admins) { $_.Admins } else { @() }
+        }
+    })
+}
+$snapshotFile = Join-Path $runHistoryDir "$runTs.json"
+$runSnapshot | ConvertTo-Json -Depth 10 | Set-Content -Path $snapshotFile -Encoding UTF8 -Force
+Write-InventoryLog "Run history snapshot saved: $snapshotFile" -Level OK
+
+# ── Auto-populate owners.json from admin assignments ──────────────────────────
+$configDir   = Join-Path (Split-Path -Parent $ScriptDir) 'config'
+$ownersFile  = Join-Path $configDir 'owners.json'
+# Build owners hashtable from existing file + new admin data
+$ownersHT = @{}
+if (Test-Path $ownersFile) {
+    try {
+        $owRaw = Get-Content $ownersFile -Raw | ConvertFrom-Json
+        foreach ($prop in $owRaw.PSObject.Properties) {
+            if ($prop.Name -notin '_comment','_example') {
+                $ownersHT[$prop.Name] = $prop.Value
+            }
+        }
+    } catch {}
+}
+
+$ownersUpdated = $false
+foreach ($entry in $processSummary) {
+    $eid = $entry.EnvironmentId
+    if ($eid -and $entry.Admins -and $entry.Admins.Count -gt 0) {
+        # Only auto-populate if no existing manual entry (or entry was auto-populated before)
+        $existing = if ($ownersHT.ContainsKey($eid)) { $ownersHT[$eid] } else { $null }
+        $isManual = $existing -and $existing.PSObject.Properties['AutoPopulated'] -and $existing.AutoPopulated -eq $false
+        if (-not $isManual) {
+            $ownersHT[$eid] = @{
+                Owner         = $entry.Admins[0]
+                AllAdmins     = @($entry.Admins)
+                AutoPopulated = $true
+                DisplayName   = $entry.DisplayName
+            }
+            $ownersUpdated = $true
+        }
+    }
+}
+if ($ownersUpdated -and (Test-Path $configDir)) {
+    $ownersHT | ConvertTo-Json -Depth 5 | Set-Content -Path $ownersFile -Encoding UTF8 -Force
+    Write-InventoryLog "owners.json updated with admin assignments." -Level OK
+}
 
 # ── Console summary ───────────────────────────────────────────────────────────
 Write-InventoryLog ''

@@ -104,18 +104,34 @@ function Get-FlagBadgeHtml {
     if (-not $Flags -or $Flags.Count -eq 0) { return '<span class="badge bg-success">Clean</span>' }
     $html = ''
     foreach ($f in $Flags) {
+        # Map flag name prefix patterns to Bootstrap badge colors:
+        #   bg-danger   = red  (active breakage or severe misconfiguration)
+        #   bg-warning  = amber (health risk, needs attention soon)
+        #   bg-secondary = gray (informational / audit-only)
+        #   bg-info     = blue  (default catch-all: informational but noteworthy)
+        # NOTE: Order matters — PowerShell switch -Wildcard uses first match.
+        # More specific patterns must appear before broad ones (e.g., MAILBOX_* before NO_*).
         $cls = switch -Wildcard ($f) {
-            'NO_*'           { 'bg-warning text-dark' }
-            'HIGH_*'         { 'bg-danger'            }
-            'LARGE_*'        { 'bg-danger'             }
-            'OLD_*'          { 'bg-warning text-dark' }
-            'MANY_*'         { 'bg-warning text-dark' }
-            'FO_*ERROR*'     { 'bg-danger'            }
-            'FO_*FAILED*'    { 'bg-danger'            }
-            'FO_MISSING_*'   { 'bg-warning text-dark' }
-            '*DISABLED*'     { 'bg-secondary'          }
-            '*FAILED*'       { 'bg-danger'             }
-            default          { 'bg-info text-dark'    }
+            'BROKEN_*'               { 'bg-danger'            }  # Active integration failures
+            '*OWNED_BY_DISABLED*'    { 'bg-danger'            }  # Flows/apps that will break
+            'MAILBOX_*'              { 'bg-danger'            }  # Email sync broken
+            'PRODUCTION_NOT_MANAGED*' { 'bg-danger'           }  # Missing governance feature on prod
+            'NOT_IN_ENVIRONMENT*'    { 'bg-warning text-dark' }  # No group policy inheritance
+            'ENVIRONMENT_ADMIN_*'    { 'bg-warning text-dark' }  # Admin assignment risk
+            'STALE_*'                { 'bg-warning text-dark' }  # Abandoned data accumulating
+            'TEAMS_*'                { 'bg-warning text-dark' }  # Teams storage approaching limit
+            'NO_*'                   { 'bg-warning text-dark' }  # Missing expected configuration
+            'HIGH_*'                 { 'bg-danger'            }  # Count above critical threshold
+            'LARGE_*'                { 'bg-danger'            }  # Size above critical threshold
+            'OLD_*'                  { 'bg-warning text-dark' }  # Data accumulating without cleanup
+            'MANY_*'                 { 'bg-warning text-dark' }  # Count above warning threshold
+            'FO_*ERROR*'             { 'bg-danger'            }  # FO job errors
+            'FO_*FAILED*'            { 'bg-danger'            }  # FO job failures
+            'FO_MISSING_*'           { 'bg-warning text-dark' }  # Missing FO cleanup jobs
+            '*MISSING_VALUES*'       { 'bg-warning text-dark' }  # Env vars without values
+            'AUDIT_DISABLED*'        { 'bg-secondary'         }  # Audit off (info, not a break)
+            '*FAILED*'               { 'bg-danger'            }  # Generic failure catch-all
+            default                  { 'bg-info text-dark'    }  # Informational
         }
         $fEsc = [System.Web.HttpUtility]::HtmlEncode($f)
         $html += "<span class='badge $cls me-1' title='$fEsc' style='font-size:0.7em'>$($fEsc -replace '_',' ')</span> "
@@ -156,6 +172,23 @@ $issueCategories = [ordered]@{
     'FO Batch Errors'          = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'FO_BATCH_JOBS_IN_ERROR' } })
     'FO Missing Cleanup Jobs'  = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'FO_MISSING_CLEANUP' } })
     'DualWrite Map Errors'     = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'DUALWRITE_MAPS_IN_ERROR' } })
+    'Broken Connection Refs'   = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'BROKEN_CONNECTION_REFERENCES' } })
+    'Flows: Disabled Owners'   = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'ACTIVE_FLOWS_OWNED_BY_DISABLED' } })
+    'Env Vars Missing Values'  = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'ENV_VARS_MISSING_VALUES' } })
+    'No Managed Solutions'     = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'NO_MANAGED_SOLUTIONS' } })
+    'Trials Expiring (>20d)'   = @($envDetails | Where-Object {
+        $_.Sku -eq 'Trial' -and $_.CreatedTime -and
+        (try { (New-TimeSpan -Start ([datetime]$_.CreatedTime) -End (Get-Date)).TotalDays -gt 20 } catch { $false })
+    })
+    'Mailbox Sync Errors'      = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'MAILBOX_SYNC_ERRORS' } })
+    'Unresolved Duplicates'    = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'HIGH_UNRESOLVED_DUPLICATES|MANY_UNRESOLVED_DUPLICATES' } })
+    'High Queue Backlog'       = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'HIGH_QUEUE_ITEM_BACKLOG' } })
+    'SLA Violations'           = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'HIGH_SLA_VIOLATIONS' } })
+    'Stale BPF Instances'      = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'STALE_BPF_INSTANCES' } })
+    'Teams Table Storage'      = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'TEAMS_TABLE_STORAGE_HIGH' } })
+    'Not Managed Environment'  = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'PRODUCTION_NOT_MANAGED_ENVIRONMENT' } })
+    'No Env Group'             = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'NOT_IN_ENVIRONMENT_GROUP' } })
+    'No Dedicated Admin'       = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'NO_DEDICATED_ENVIRONMENT_ADMIN' } })
 }
 
 # ── Summary stats ─────────────────────────────────────────────────────────────
@@ -166,6 +199,246 @@ $totalAllMB   = ($envDetails | Measure-Object -Property StorageTotal_MB -Sum).Su
 $envsWithFO   = @($envDetails | Where-Object { $_.HasFO }).Count
 $envsWithDV   = @($envDetails | Where-Object { $_.HasDataverse }).Count
 $envsWithFlags= @($envDetails | Where-Object { $_.AllFlags.Count -gt 0 }).Count
+
+# ── Load configuration files ─────────────────────────────────────────────────
+$configDir = Join-Path (Split-Path -Parent $ScriptDir) 'config'
+
+# Flag severity mapping
+$flagSeverity = @{ Critical = @(); High = @(); Medium = @(); Low = @(); Weights = @{ Critical = 15; High = 8; Medium = 4; Low = 1 } }
+$severityFile = Join-Path $configDir 'flag-severity.json'
+if (Test-Path $severityFile) {
+    try {
+        $fsCfg = Get-Content $severityFile -Raw | ConvertFrom-Json
+        $flagSeverity.Critical = @($fsCfg.Critical)
+        $flagSeverity.High     = @($fsCfg.High)
+        $flagSeverity.Medium   = @($fsCfg.Medium)
+        $flagSeverity.Low      = @($fsCfg.Low)
+        if ($fsCfg.Weights) {
+            $flagSeverity.Weights.Critical = [int]$fsCfg.Weights.Critical
+            $flagSeverity.Weights.High     = [int]$fsCfg.Weights.High
+            $flagSeverity.Weights.Medium   = [int]$fsCfg.Weights.Medium
+            $flagSeverity.Weights.Low      = [int]$fsCfg.Weights.Low
+        }
+        Write-Host "  Loaded flag severity config ($($flagSeverity.Critical.Count) critical, $($flagSeverity.High.Count) high, $($flagSeverity.Medium.Count) medium, $($flagSeverity.Low.Count) low)" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  Warning: Could not parse flag-severity.json - using defaults" -ForegroundColor Yellow
+    }
+}
+
+# SKU profiles
+$skuProfiles = @{}
+$skuProfileFile = Join-Path $configDir 'sku-profiles.json'
+if (Test-Path $skuProfileFile) {
+    try {
+        $spRaw = Get-Content $skuProfileFile -Raw | ConvertFrom-Json
+        foreach ($prop in $spRaw.PSObject.Properties) {
+            if ($prop.Name -ne '_comment') { $skuProfiles[$prop.Name] = $prop.Value }
+        }
+        Write-Host "  Loaded SKU profiles: $($skuProfiles.Keys -join ', ')" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  Warning: Could not parse sku-profiles.json" -ForegroundColor Yellow
+    }
+}
+
+# Owners
+$owners = @{}
+$ownersFile = Join-Path $configDir 'owners.json'
+if (Test-Path $ownersFile) {
+    try {
+        $owRaw = Get-Content $ownersFile -Raw | ConvertFrom-Json
+        foreach ($prop in $owRaw.PSObject.Properties) {
+            if ($prop.Name -notin '_comment','_example') { $owners[$prop.Name] = $prop.Value }
+        }
+        Write-Host "  Loaded owner data for $($owners.Count) environments" -ForegroundColor DarkGray
+    } catch {}
+}
+
+# ── Governance score computation ─────────────────────────────────────────────
+function Get-FlagSeverity {
+    param([string]$Flag)
+    # Extract flag name prefix (before the parenthetical detail)
+    $flagName = ($Flag -split '\s*\(')[0].Trim()
+    if ($flagName -in $flagSeverity.Critical) { return 'Critical' }
+    if ($flagName -in $flagSeverity.High)     { return 'High' }
+    if ($flagName -in $flagSeverity.Medium)   { return 'Medium' }
+    if ($flagName -in $flagSeverity.Low)      { return 'Low' }
+    return 'Info'
+}
+
+function Get-GovernanceScore {
+    # Score starts at 100. Each flag deducts points by severity (Critical=15, High=8,
+    # Medium=4, Low=1) using weights from config/flag-severity.json. Flags listed in the
+    # SKU profile's Suppress list (e.g. NO_RETENTION_POLICIES on Developer environments)
+    # are expected for that env type and count as only 1 point instead of full deduction.
+    # Score is clamped to [0, 100].
+    param([string[]]$Flags, [string]$Sku)
+    $score = 100
+    $profile = if ($skuProfiles.ContainsKey($Sku)) { $skuProfiles[$Sku] } else { $null }
+    $suppressList = if ($profile -and $profile.Suppress) { @($profile.Suppress) } else { @() }
+
+    foreach ($f in $Flags) {
+        $flagName = ($f -split '\s*\(')[0].Trim()
+        # SKU profile suppression: suppressed flags count as Info (1 point) instead of their normal severity
+        if ($flagName -in $suppressList) {
+            $score -= 1
+            continue
+        }
+        $sev = Get-FlagSeverity $f
+        $deduction = switch ($sev) {
+            'Critical' { $flagSeverity.Weights.Critical }
+            'High'     { $flagSeverity.Weights.High }
+            'Medium'   { $flagSeverity.Weights.Medium }
+            'Low'      { $flagSeverity.Weights.Low }
+            default    { 0 }
+        }
+        $score -= $deduction
+    }
+    return [Math]::Max(0, [Math]::Min(100, $score))
+}
+
+# Compute per-environment scores
+foreach ($e in $envDetails) {
+    $score = Get-GovernanceScore -Flags $e.AllFlags -Sku $e.Sku
+    Add-Member -InputObject $e -NotePropertyName 'GovernanceScore' -NotePropertyValue $score -Force
+
+    $ownerInfo = if ($owners.ContainsKey($e.EnvironmentId)) { $owners[$e.EnvironmentId] } else { $null }
+    $ownerName = if ($ownerInfo -and $ownerInfo.Owner) { $ownerInfo.Owner } else { '' }
+    Add-Member -InputObject $e -NotePropertyName 'Owner' -NotePropertyValue $ownerName -Force
+}
+
+# Tenant-wide weighted governance score
+# Production environments count 3×, Sandbox 1.5×, Developer 0.5×, Trial 0.25×
+# (GovernanceWeight from sku-profiles.json) so production health dominates the score.
+# Formula: sum(score × weight) ÷ sum(weights), rounded to the nearest integer.
+$weightedSum   = 0.0
+$weightTotal   = 0.0
+foreach ($e in $envDetails) {
+    $sku = $e.Sku
+    $w   = if ($skuProfiles.ContainsKey($sku) -and $skuProfiles[$sku].GovernanceWeight) {
+               [double]$skuProfiles[$sku].GovernanceWeight
+           } else { 1.0 }
+    $weightedSum += $e.GovernanceScore * $w
+    $weightTotal += $w
+}
+$tenantScore = if ($weightTotal -gt 0) { [Math]::Round($weightedSum / $weightTotal, 0) } else { 0 }
+
+$criticalEnvs = @($envDetails | Where-Object { $_.GovernanceScore -lt 50 }).Count
+$healthyEnvs  = @($envDetails | Where-Object { $_.GovernanceScore -ge 80 }).Count
+
+Write-Host "  Tenant governance score: $tenantScore / 100 ($criticalEnvs critical, $healthyEnvs healthy)" -ForegroundColor $(if ($tenantScore -ge 70) {'Green'} elseif ($tenantScore -ge 40) {'Yellow'} else {'Red'})
+
+# ── Delta reporting (compare with previous run) ─────────────────────────────
+# Invoke-DataverseInventory.ps1 saves a timestamped snapshot to data/run-history/
+# at the end of every run. This block loads the second-to-last snapshot (Select -Skip 1
+# skips the current run's snapshot) and diffs flags and storage totals against it.
+#
+# Flags are compared by name prefix only — the parenthetical detail suffix is stripped —
+# so "HIGH_FAILED_JOBS_30D (12 jobs)" and "HIGH_FAILED_JOBS_30D (8 jobs)" are treated
+# as the same issue rather than generating a resolved+new pair on every count change.
+# Storage differences ≥ 10 MB are surfaced as growth events.
+$deltaHtml = ''
+$runHistoryDir = Join-Path $DataPath 'run-history'
+if (Test-Path $runHistoryDir) {
+    $previousRuns = @(Get-ChildItem -Path $runHistoryDir -Filter '*.json' | Sort-Object Name -Descending | Select-Object -Skip 1 -First 1)
+    if ($previousRuns.Count -gt 0) {
+        try {
+            $prevRun = Get-Content $previousRuns[0].FullName -Raw | ConvertFrom-Json
+            $prevEnvMap = @{}
+            foreach ($pe in $prevRun.Environments) { $prevEnvMap[$pe.EnvironmentId] = $pe }
+
+            $newFlags     = [System.Collections.Generic.List[string]]::new()
+            $resolvedFlags = [System.Collections.Generic.List[string]]::new()
+            $storageGrowth = [System.Collections.Generic.List[PSObject]]::new()
+
+            foreach ($e in $envDetails) {
+                $prev = if ($prevEnvMap.ContainsKey($e.EnvironmentId)) { $prevEnvMap[$e.EnvironmentId] } else { $null }
+                if (-not $prev) { continue }
+
+                $prevFlags = @($prev.AllFlags)
+                $currFlags = @($e.AllFlags)
+
+                # Extract flag name prefixes for comparison
+                $prevNames = @($prevFlags | ForEach-Object { ($_ -split '\s*\(')[0].Trim() })
+                $currNames = @($currFlags | ForEach-Object { ($_ -split '\s*\(')[0].Trim() })
+
+                foreach ($cn in $currNames) {
+                    if ($cn -and $cn -notin $prevNames) { $newFlags.Add("$($e.DisplayName): $cn") }
+                }
+                foreach ($pn in $prevNames) {
+                    if ($pn -and $pn -notin $currNames) { $resolvedFlags.Add("$($e.DisplayName): $pn") }
+                }
+
+                # Storage growth
+                $prevStorage = if ($prev.StorageTotal_MB) { [double]$prev.StorageTotal_MB } else { 0 }
+                $currStorage = [double]$e.StorageTotal_MB
+                $growth = $currStorage - $prevStorage
+                if ([Math]::Abs($growth) -gt 10) {
+                    $storageGrowth.Add([PSCustomObject]@{
+                        DisplayName = $e.DisplayName
+                        Sku         = $e.Sku
+                        Previous    = $prevStorage
+                        Current     = $currStorage
+                        Growth      = [Math]::Round($growth, 1)
+                    })
+                }
+            }
+
+            $prevDate = try { [datetime]$prevRun.RunAt | Get-Date -Format 'yyyy-MM-dd HH:mm' } catch { $previousRuns[0].BaseName }
+
+            $deltaRows = ''
+            if ($newFlags.Count -gt 0) {
+                foreach ($nf in ($newFlags | Select-Object -First 30)) {
+                    $nfEsc = [System.Web.HttpUtility]::HtmlEncode($nf)
+                    $deltaRows += "<tr><td><span class='badge bg-danger'>NEW</span></td><td>$nfEsc</td></tr>"
+                }
+            }
+            if ($resolvedFlags.Count -gt 0) {
+                foreach ($rf in ($resolvedFlags | Select-Object -First 30)) {
+                    $rfEsc = [System.Web.HttpUtility]::HtmlEncode($rf)
+                    $deltaRows += "<tr><td><span class='badge bg-success'>RESOLVED</span></td><td>$rfEsc</td></tr>"
+                }
+            }
+
+            $storageGrowthRows = ''
+            foreach ($sg in ($storageGrowth | Sort-Object Growth -Descending | Select-Object -First 15)) {
+                $nameEsc = [System.Web.HttpUtility]::HtmlEncode($sg.DisplayName)
+                $growthFmt = if ($sg.Growth -gt 0) { "+$(Format-MB $sg.Growth)" } else { Format-MB $sg.Growth }
+                $growthClass = if ($sg.Growth -gt 500) {'text-danger fw-bold'} elseif ($sg.Growth -gt 0) {'text-warning'} else {'text-success'}
+                $storageGrowthRows += "<tr><td>$nameEsc</td><td>$($sg.Sku)</td><td>$(Format-MB $sg.Previous)</td><td>$(Format-MB $sg.Current)</td><td class='$growthClass'>$growthFmt</td></tr>"
+            }
+
+            $deltaHtml = @"
+<section id="delta" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Changes Since Last Run</h5></div>
+  <p class="text-muted small">Comparing with previous run: $prevDate ($($newFlags.Count) new issues, $($resolvedFlags.Count) resolved)</p>
+  $(if ($deltaRows) {
+    @"
+  <h6>Flag Changes</h6>
+  <table class="table table-sm table-bordered" style="max-width:800px">
+    <thead class="table-secondary"><tr><th style="width:80px">Status</th><th>Environment: Flag</th></tr></thead>
+    <tbody>$deltaRows</tbody>
+  </table>
+"@
+  } else { "<p class='text-muted'>No flag changes detected.</p>" })
+  $(if ($storageGrowthRows) {
+    @"
+  <h6 class="mt-3">Storage Growth (Top 15)</h6>
+  <table class="table table-sm table-bordered" style="max-width:800px">
+    <thead class="table-secondary"><tr><th>Environment</th><th>SKU</th><th>Previous</th><th>Current</th><th>Growth</th></tr></thead>
+    <tbody>$storageGrowthRows</tbody>
+  </table>
+"@
+  } else { '' })
+</section>
+"@
+            Write-Host "  Delta report: $($newFlags.Count) new flags, $($resolvedFlags.Count) resolved, $($storageGrowth.Count) storage changes" -ForegroundColor Cyan
+        } catch {
+            Write-Host "  Warning: Could not compute delta report: $_" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  No previous run found for delta comparison" -ForegroundColor DarkGray
+    }
+}
 
 # ── Build HTML rows for environments table ────────────────────────────────────
 Add-Type -AssemblyName System.Web
@@ -207,6 +480,18 @@ function Build-EnvTableRows {
         $nameEsc = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
         $stateVal    = if ($e.State)    { $e.State }    else { 'N/A' }
         $locationVal = if ($e.Location) { $e.Location } else { 'N/A' }
+
+        # Governance score badge
+        $gs = if ($null -ne $e.GovernanceScore) { $e.GovernanceScore } else { 'N/A' }
+        $gsClass = if ($gs -is [int] -or $gs -is [double]) {
+            if     ($gs -ge 80) { 'bg-success' }
+            elseif ($gs -ge 50) { 'bg-warning text-dark' }
+            else                { 'bg-danger' }
+        } else { 'bg-secondary' }
+
+        # Owner
+        $ownerEsc = if ($e.Owner) { [System.Web.HttpUtility]::HtmlEncode($e.Owner) } else { '<span class="text-muted">-</span>' }
+
         $null = $sb.Append(@"
 <tr class='$skuClass'>
   <td><strong>$nameEsc</strong><br><small class='text-muted'>$($e.EnvironmentId)</small><br>$defTag $foTag $errTag</td>
@@ -215,8 +500,8 @@ function Build-EnvTableRows {
   <td>$locationVal</td>
   <td data-sort='$($e.StorageTotal_MB)'><strong>$totalFmt</strong><br><small>DB: $dbFmt<br>File: $fileFmt<br>Log: $logFmt</small></td>
   <td>$users</td>
-  <td>$bulkDel</td>
-  <td>$failNum</td>
+  <td data-sort='$gs'><span class='badge $gsClass'>$gs</span></td>
+  <td><small>$ownerEsc</small></td>
   <td>$lastAudit</td>
   <td>$flags</td>
 </tr>
@@ -274,6 +559,37 @@ foreach ($cat in $issueCategories.Keys) {
 "@
 }
 
+# ── Governance score table rows ───────────────────────────────────────────────
+$govTableRows = ''
+foreach ($e in ($envDetails | Sort-Object GovernanceScore)) {
+    $nameEsc = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+    $gs = $e.GovernanceScore
+    $gsClass = if ($gs -ge 80) {'bg-success'} elseif ($gs -ge 50) {'bg-warning text-dark'} else {'bg-danger'}
+    $barColor = if ($gs -ge 80) {'bg-success'} elseif ($gs -ge 50) {'bg-warning'} else {'bg-danger'}
+
+    # Count flags by severity
+    $critCount = @($e.AllFlags | Where-Object { (Get-FlagSeverity $_) -eq 'Critical' }).Count
+    $highCount = @($e.AllFlags | Where-Object { (Get-FlagSeverity $_) -eq 'High' }).Count
+    $medCount  = @($e.AllFlags | Where-Object { (Get-FlagSeverity $_) -eq 'Medium' }).Count
+    $lowCount  = @($e.AllFlags | Where-Object { (Get-FlagSeverity $_) -eq 'Low' }).Count
+
+    $ownerEsc = if ($e.Owner) { [System.Web.HttpUtility]::HtmlEncode($e.Owner) } else { '-' }
+
+    $govTableRows += @"
+<tr>
+  <td>$nameEsc<br><small class='text-muted'>$($e.Sku)</small></td>
+  <td data-sort='$gs'><span class='badge $gsClass'>$gs</span>
+    <div class='progress mt-1' style='height:4px'><div class='progress-bar $barColor' style='width:${gs}%'></div></div>
+  </td>
+  <td>$(if ($critCount -gt 0) {"<span class='badge bg-danger'>$critCount</span>"} else {'0'})</td>
+  <td>$(if ($highCount -gt 0) {"<span class='badge bg-danger'>$highCount</span>"} else {'0'})</td>
+  <td>$(if ($medCount -gt 0) {"<span class='badge bg-warning text-dark'>$medCount</span>"} else {'0'})</td>
+  <td>$lowCount</td>
+  <td><small>$ownerEsc</small></td>
+</tr>
+"@
+}
+
 # ── FO environment detail rows ────────────────────────────────────────────────
 $foEnvs = @($envDetails | Where-Object { $_.HasFO })
 $foTableRows = ''
@@ -304,6 +620,176 @@ foreach ($e in $foEnvs) {
 </tr>
 "@
 }
+
+# ── Storage cleanup recommendations ───────────────────────────────────────────
+# Synthesizes CleanupTableHealth, AsyncOperations, and OrgSettings data from the
+# CE collector into per-environment, ranked, actionable cleanup recommendations.
+# Each recommendation maps to a specific Bulk Delete Job or settings change.
+$storageCleanupRows = ''
+$cleanupRecCount    = 0
+
+foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
+    if (-not $e.CE -or -not $e.CE.Sections) { continue }
+    $sections = $e.CE.Sections
+    $cth      = $sections.CleanupTableHealth
+    $asyncCnt = if ($sections.AsyncOperations) { $sections.AsyncOperations.Counts } else { $null }
+    $orgSet   = $sections.OrgSettings
+    $nameEsc  = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+
+    $recs = [System.Collections.Generic.List[PSObject]]::new()
+
+    # Completed async operations older than 90 days — largest single DB storage category
+    if ($asyncCnt -and $asyncCnt.CompletedOlderThan90d -gt 0) {
+        $cnt = [int]$asyncCnt.CompletedOlderThan90d
+        if ($cnt -gt 0) {
+            $prio = if ($cnt -gt 100000) { 'High' } elseif ($cnt -gt 10000) { 'Medium' } else { $null }
+            if ($prio) {
+                $recs.Add([PSCustomObject]@{
+                    Priority = $prio; StorageType = 'DB + Log'
+                    DataType = 'Completed Async Operations (&gt;90d)'
+                    Count    = $cnt
+                    Action   = 'Bulk Delete Job: <em>System Jobs</em> &rarr; Status Reason = Succeeded/Canceled/Failed AND Created On &lt; 90 days ago'
+                })
+            }
+        }
+    }
+
+    # Suspended system jobs — often a sign of a broken plugin or workflow loop
+    if ($asyncCnt -and $asyncCnt.Suspended -gt 500) {
+        $cnt = [int]$asyncCnt.Suspended
+        $recs.Add([PSCustomObject]@{
+            Priority = 'High'; StorageType = 'DB'
+            DataType = 'Suspended System Jobs'
+            Count    = $cnt
+            Action   = 'Investigate root cause (broken plugin/flow), then Bulk Delete Job: <em>System Jobs</em> &rarr; Status = Suspended AND Created On &lt; 30 days ago'
+        })
+    }
+
+    # Old succeeded workflow logs — cascade-deleted when the parent async op is deleted
+    if ($cth -and $cth.WorkflowLogOldSucceeded -gt 0) {
+        $cnt = [int]$cth.WorkflowLogOldSucceeded
+        $prio = if ($cnt -gt 50000) { 'High' } elseif ($cnt -gt 10000) { 'Medium' } else { $null }
+        if ($prio) {
+            $recs.Add([PSCustomObject]@{
+                Priority = $prio; StorageType = 'DB'
+                DataType = 'Old Succeeded Workflow Logs (&gt;30d)'
+                Count    = $cnt
+                Action   = 'Bulk Delete Job: <em>System Jobs</em> &rarr; Status = Succeeded AND Created On &lt; 30 days ago (WorkflowLog cascade-deletes with parent AsyncOperation)'
+            })
+        }
+    }
+
+    # Plugin trace logging is on — fills Log storage quickly; should be Off in production
+    if ($orgSet -and $orgSet.PluginTraceLogSetting -and $orgSet.PluginTraceLogSetting -ne 'Off') {
+        $traceCount = if ($cth -and $cth.PluginTraceLogTotal -gt 0) { [int]$cth.PluginTraceLogTotal } else { 'N/A' }
+        $recs.Add([PSCustomObject]@{
+            Priority = 'High'; StorageType = 'Log'
+            DataType = "Plugin Trace Logging ON ($($orgSet.PluginTraceLogSetting))"
+            Count    = $traceCount
+            Action   = 'Disable: Settings &rarr; Administration &rarr; System Settings &rarr; Customization &rarr; Enable logging to plug-in trace log = <strong>Off</strong>. Built-in job auto-clears old records once disabled.'
+        })
+    } elseif ($cth -and $cth.PluginTraceLogTotal -gt 5000) {
+        # Trace logging appears Off but logs are still accumulating — verify the built-in cleanup job is running
+        $recs.Add([PSCustomObject]@{
+            Priority = 'Medium'; StorageType = 'Log'
+            DataType = 'Plugin Trace Logs Accumulating'
+            Count    = [int]$cth.PluginTraceLogTotal
+            Action   = 'Verify trace logging is Off. If already Off, the built-in daily cleanup job should clear these within 24h — check that job is not suspended.'
+        })
+    }
+
+    # Large attachment notes (>1 MB each) — primary file storage consumers
+    if ($cth -and $cth.LargeAnnotations -gt 0) {
+        $cnt = [int]$cth.LargeAnnotations
+        $prio = if ($cnt -gt 500) { 'High' } elseif ($cnt -gt 100) { 'Medium' } else { $null }
+        if ($prio) {
+            $recs.Add([PSCustomObject]@{
+                Priority = $prio; StorageType = 'File'
+                DataType = 'Large Attachment Notes (&gt;1 MB)'
+                Count    = $cnt
+                Action   = 'Bulk Delete Job: <em>Notes</em> &rarr; File Size (Bytes) &gt; 1048576 AND Created On &lt; [your retention date]. Review which tables generate these before deleting.'
+            })
+        }
+    }
+
+    # Old completed email activities — EmailBase, ActivityPartyBase, ActivityPointerBase all grow
+    if ($cth -and $cth.OldCompletedEmails -gt 0) {
+        $cnt = [int]$cth.OldCompletedEmails
+        $prio = if ($cnt -gt 10000) { 'High' } elseif ($cnt -gt 2000) { 'Medium' } else { $null }
+        if ($prio) {
+            $recs.Add([PSCustomObject]@{
+                Priority = $prio; StorageType = 'DB'
+                DataType = 'Old Completed Email Activities (&gt;90d)'
+                Count    = $cnt
+                Action   = 'Bulk Delete Job: <em>Email Messages</em> &rarr; Status = Completed AND Actual End &lt; 90 days ago. Exclude emails linked to open cases or important records.'
+            })
+        }
+    }
+
+    # Old import job history records
+    if ($cth -and $cth.OldImportJobRecords -gt 50) {
+        $recs.Add([PSCustomObject]@{
+            Priority = 'Low'; StorageType = 'DB'
+            DataType = 'Old Import Job History (&gt;90d)'
+            Count    = [int]$cth.OldImportJobRecords
+            Action   = 'Bulk Delete Job: <em>System Jobs</em> &rarr; System Job Type = Import AND Created On &lt; 90 days ago'
+        })
+    }
+
+    # Old bulk delete operation history records (the cleanup jobs themselves)
+    if ($cth -and $cth.OldBulkDeleteOpRecords -gt 100) {
+        $recs.Add([PSCustomObject]@{
+            Priority = 'Low'; StorageType = 'DB'
+            DataType = 'Old Bulk Delete Operation History (&gt;90d)'
+            Count    = [int]$cth.OldBulkDeleteOpRecords
+            Action   = 'Self-cleaning Bulk Delete Job: <em>System Jobs</em> &rarr; System Job Type = Bulk Delete AND Status = Succeeded AND Created On &lt; 90 days ago'
+        })
+    }
+
+    # Audit retention set to Forever — AuditBase will grow without bound
+    if ($orgSet -and $orgSet.AuditEnabled -and $orgSet.AuditRetentionDays -eq -1) {
+        $recs.Add([PSCustomObject]@{
+            Priority = 'High'; StorageType = 'DB'
+            DataType = 'Audit Retention = Forever (no auto-delete)'
+            Count    = 'N/A'
+            Action   = 'Settings &rarr; Auditing &rarr; Global Audit Settings &rarr; Set Retention Period (e.g., 365 days). Without a limit, AuditBase grows indefinitely.'
+        })
+    }
+
+    if ($recs.Count -eq 0) { continue }
+    $cleanupRecCount += $recs.Count
+
+    # Sort within environment: High first, then Medium, then Low
+    $sortedRecs = $recs | Sort-Object { switch ($_.Priority) { 'High' { 0 } 'Medium' { 1 } default { 2 } } }
+
+    foreach ($rec in $sortedRecs) {
+        $prioClass = switch ($rec.Priority) {
+            'High'   { 'bg-danger' }
+            'Medium' { 'bg-warning text-dark' }
+            default  { 'bg-secondary' }
+        }
+        $stClass = switch ($rec.StorageType) {
+            'DB'       { 'text-primary' }
+            'File'     { 'text-success' }
+            'Log'      { 'text-warning' }
+            'DB + Log' { 'text-danger' }
+            default    { '' }
+        }
+        $countFmt = if ($rec.Count -is [int]) { '{0:N0}' -f $rec.Count } else { $rec.Count }
+        $storageCleanupRows += @"
+<tr>
+  <td>$nameEsc<br><small class='text-muted'>$($e.Sku)</small></td>
+  <td><span class='badge $prioClass'>$($rec.Priority)</span></td>
+  <td>$($rec.DataType)</td>
+  <td class='$stClass fw-bold small'>$($rec.StorageType)</td>
+  <td>$countFmt</td>
+  <td><small>$($rec.Action)</small></td>
+</tr>
+"@
+    }
+}
+
+Write-Host "  Storage cleanup recommendations: $cleanupRecCount across $($envDetails.Count) environments" -ForegroundColor Cyan
 
 # ── HTML template ─────────────────────────────────────────────────────────────
 $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -350,9 +836,12 @@ $html = @"
       <div class="card-body toc p-2">
         <a href="#summary">Executive Summary</a>
         <a href="#issues">Issue Overview</a>
+        <a href="#delta">Changes (Delta)</a>
+        <a href="#governance">Governance Scores</a>
         <a href="#all-envs">All Environments</a>
         <a href="#storage">Storage Analysis</a>
         <a href="#cleanup">Cleanup Gaps</a>
+        <a href="#storage-cleanup">Cleanup Recommendations</a>
         <a href="#activity">Activity / Unused</a>
         <a href="#fo-section">Finance & Operations</a>
         <a href="#run-info">Collection Info</a>
@@ -393,6 +882,32 @@ $html = @"
       </div>
     </div>
   </div>
+  <div class="row g-3 mb-3">
+    <div class="col-6 col-md-3">
+      <div class="card stat-card text-center p-3" style="border-left-color: $(if ($tenantScore -ge 70) {'#198754'} elseif ($tenantScore -ge 40) {'#ffc107'} else {'#dc3545'})">
+        <div class="h2 fw-bold" style="color: $(if ($tenantScore -ge 70) {'#198754'} elseif ($tenantScore -ge 40) {'#856404'} else {'#dc3545'})">$tenantScore<small style="font-size:0.5em">/100</small></div>
+        <div class="small text-muted">Tenant Governance Score</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card stat-card danger text-center p-3">
+        <div class="h2 fw-bold text-danger">$criticalEnvs</div>
+        <div class="small text-muted">Critical Envs (Score &lt; 50)</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card stat-card text-center p-3" style="border-left-color: #198754">
+        <div class="h2 fw-bold text-success">$healthyEnvs</div>
+        <div class="small text-muted">Healthy Envs (Score &ge; 80)</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card stat-card text-center p-3">
+        <div class="h3 fw-bold">$($envDetails.Count - $healthyEnvs - $criticalEnvs)</div>
+        <div class="small text-muted">Needs Attention (50-79)</div>
+      </div>
+    </div>
+  </div>
   <div class="row g-3">
     <div class="col-6 col-md-3">
       <div class="card stat-card text-center p-3">
@@ -428,6 +943,28 @@ $html = @"
   <div class="row">$issueCardsHtml</div>
 </section>
 
+$deltaHtml
+
+<!-- GOVERNANCE SCORES -->
+<section id="governance" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Governance Scores</h5></div>
+  <p class="text-muted small">Per-environment governance score (0-100) based on flag severity. Scores are adjusted for SKU type using <code>config/sku-profiles.json</code>. Severity levels are defined in <code>config/flag-severity.json</code>.</p>
+  <table id="govTable" class="table table-sm table-hover table-bordered" style="width:100%">
+    <thead class="table-dark">
+      <tr>
+        <th>Environment</th>
+        <th>Score</th>
+        <th>Critical</th>
+        <th>High</th>
+        <th>Medium</th>
+        <th>Low</th>
+        <th>Owner</th>
+      </tr>
+    </thead>
+    <tbody>$govTableRows</tbody>
+  </table>
+</section>
+
 <!-- ALL ENVIRONMENTS -->
 <section id="all-envs" class="mb-5">
   <div class="section-header"><h5 class="mb-0">All Environments</h5></div>
@@ -441,8 +978,8 @@ $html = @"
           <th>Region</th>
           <th>Storage</th>
           <th>Active Users</th>
-          <th>Bulk Del Jobs</th>
-          <th>Failed Jobs (30d)</th>
+          <th>Score</th>
+          <th>Owner</th>
           <th>Last Audit</th>
           <th>Issues</th>
         </tr>
@@ -524,6 +1061,38 @@ $(
 )
     </tbody>
   </table>
+</section>
+
+<!-- STORAGE CLEANUP RECOMMENDATIONS -->
+<section id="storage-cleanup" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Storage Cleanup Recommendations ($cleanupRecCount items)</h5></div>
+  <p class="text-muted small">
+    Ranked, actionable cleanup tasks derived from collected data. All actions use Dataverse
+    <strong>Bulk Delete Jobs</strong> (Settings &rarr; Data Management &rarr; Bulk Record Deletion)
+    unless stated otherwise. This tool is <strong>read-only</strong> — these are recommendations only;
+    nothing has been deleted.
+  </p>
+  $(if ($cleanupRecCount -gt 0) {
+    @"
+  <div class="table-responsive">
+  <table id="cleanupRecTable" class="table table-sm table-hover table-bordered" style="width:100%">
+    <thead class="table-dark">
+      <tr>
+        <th>Environment</th>
+        <th>Priority</th>
+        <th>What to Clean</th>
+        <th>Storage Type</th>
+        <th>Record Count</th>
+        <th>Recommended Action / Filter</th>
+      </tr>
+    </thead>
+    <tbody>$storageCleanupRows</tbody>
+  </table>
+  </div>
+"@
+  } else {
+    "<p class='text-muted'>No cleanup recommendations generated. Run with <code>-IncludeEntityCounts</code> for additional storage analysis, or verify environments have Dataverse enabled.</p>"
+  })
 </section>
 
 <!-- ACTIVITY / UNUSED -->
@@ -646,7 +1215,9 @@ $(
     columnDefs: [{ targets: 4, type: 'num' }]
   });
   `$('#cleanupTable').DataTable({ pageLength: 25 });
+  `$('#cleanupRecTable').DataTable({ pageLength: 25, order: [[1,'asc'],[4,'desc']] });
   `$('#activityTable').DataTable({ pageLength: 25, order: [[7,'desc']] });
+  `$('#govTable').DataTable({ pageLength: 25, order: [[1,'asc']], columnDefs: [{ targets: 1, type: 'num' }] });
   `$('#foTable').DataTable({ pageLength: 25 });
 });
 </script>
@@ -665,6 +1236,7 @@ Write-Host "Report generated: $ReportPath" -ForegroundColor Green
 Write-Host "  - $($envDetails.Count) environments"                  -ForegroundColor Cyan
 Write-Host "  - $envsWithFlags environments with flags"              -ForegroundColor $(if ($envsWithFlags -gt 0) {'Yellow'} else {'Green'})
 Write-Host "  - $(Format-MB $totalAllMB) total storage across tenant" -ForegroundColor Cyan
+Write-Host "  - Tenant governance score: $tenantScore / 100"         -ForegroundColor $(if ($tenantScore -ge 70) {'Green'} elseif ($tenantScore -ge 40) {'Yellow'} else {'Red'})
 
 if ($OpenReport) {
     Write-Host "Opening report in browser..." -ForegroundColor Cyan

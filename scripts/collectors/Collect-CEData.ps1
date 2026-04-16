@@ -118,10 +118,27 @@ function Collect-CEEnvironmentData {
                                        -SaveFileName 'bulk-delete-jobs.json'
 
     $scheduledJobs = @($bulkDeleteJobs | Where-Object { $_.statuscode -in 0,1,2 })
+
+    # Check if scheduled jobs cover the highest-priority cleanup targets by job name.
+    # Bulk delete job names are user-defined, so we match common naming patterns.
+    $coversAsyncOps = ($scheduledJobs | Where-Object {
+        $_.name -match 'async|system.?job|workflow.?job|completed.?job'
+    }).Count -gt 0
+    $coversAudit    = ($scheduledJobs | Where-Object { $_.name -match 'audit' }).Count -gt 0
+    $coversEmail    = ($scheduledJobs | Where-Object { $_.name -match 'email|activit' }).Count -gt 0
+
     $result.Sections['BulkDeleteJobs'] = @{
         TotalCount     = if ($bulkDeleteJobs) { @($bulkDeleteJobs).Count } else { 0 }
         ScheduledCount = $scheduledJobs.Count
+        CoversAsyncOps = $coversAsyncOps
+        CoversAudit    = $coversAudit
+        CoversEmail    = $coversEmail
         Note           = if ($scheduledJobs.Count -eq 0) { 'NO_SCHEDULED_BULK_DELETE' } else { $null }
+        Notes          = @(
+            if ($scheduledJobs.Count -gt 0 -and -not $coversAsyncOps) {
+                'NO_ASYNCOP_BULK_DELETE_JOB - no scheduled job appears to target system jobs or async operations'
+            }
+        ) | Where-Object { $_ }
         NextRunTimes   = @($scheduledJobs | ForEach-Object { $_.nextruntime }) | Select-Object -First 5
     }
 
@@ -185,6 +202,52 @@ function Collect-CEEnvironmentData {
         $result.Sections['AsyncOperations'] = @{ Counts = @{}; Notes = @('QUERY_FAILED') }
     }
 
+    # ── 3b. Organization Health Settings ─────────────────────────────────────
+    # Single query for key org-level settings that control storage growth and cleanup.
+    #   plugintracelogsetting : 0=Off, 1=Exception Only, 2=All
+    #   auditretentionperiodv2: -1=Forever (no auto-delete); other value = days
+    Write-InventoryLog '    [Organization Health Settings]...' -Indent 2
+    $orgSettings = $null
+    try {
+        $orgResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                       -ODataPath "organizations?`$select=organizationid,auditretentionperiodv2,plugintracelogsetting,isauditenabled&`$top=1" `
+                       -TimeoutSec 60
+        $orgSettings = if ($orgResp.value) { $orgResp.value[0] } else { $null }
+        if ($orgSettings) {
+            Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'org-settings.json' -Data $orgSettings
+        }
+
+        $traceLogSetting    = if ($orgSettings.plugintracelogsetting -ne $null) { [int]$orgSettings.plugintracelogsetting } else { 0 }
+        $auditRetentionDays = if ($orgSettings.auditretentionperiodv2 -ne $null) { [int]$orgSettings.auditretentionperiodv2 } else { $null }
+        $auditEnabled       = if ($orgSettings) { [bool]$orgSettings.isauditenabled } else { $false }
+
+        $traceLogLabel = switch ($traceLogSetting) { 0 { 'Off' } 1 { 'Exception Only' } 2 { 'All' } default { 'Unknown' } }
+        $auditRetentionLabel = if ($auditRetentionDays -eq -1) { 'Forever (no auto-delete)' }
+                               elseif ($auditRetentionDays -ne $null) { "$auditRetentionDays days" }
+                               else { 'Not configured' }
+
+        $result.Sections['OrgSettings'] = @{
+            PluginTraceLogSetting = $traceLogLabel
+            AuditRetentionDays    = $auditRetentionDays
+            AuditEnabled          = $auditEnabled
+            Notes                 = @(
+                if ($traceLogSetting -gt 0) {
+                    "PLUGIN_TRACE_LOGGING_ENABLED ($traceLogLabel) - plug-in trace log should be Off in production to prevent PluginTraceLogBase table growth"
+                }
+                if ($auditEnabled -and $auditRetentionDays -eq -1) {
+                    'AUDIT_RETENTION_SET_TO_FOREVER - auditing is on but retention is Forever; AuditBase table will grow without bound until manually deleted'
+                }
+                if ($auditEnabled -and $auditRetentionDays -eq $null) {
+                    'AUDIT_RETENTION_NOT_CONFIGURED - auditing is enabled but no retention period is set'
+                }
+            ) | Where-Object { $_ }
+        }
+        Write-InventoryLog "    -> Trace logging: $traceLogLabel | Audit retention: $auditRetentionLabel | Auditing on: $auditEnabled" -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Organization settings query failed: $_" -Level WARN -Indent 3
+        $result.Sections['OrgSettings'] = @{ Notes = @('QUERY_FAILED') }
+    }
+
     # ── 4. Solutions ─────────────────────────────────────────────────────────
     $solOData = "solutions?" +
         "`$select=uniquename,friendlyname,version,ismanaged,installedon,modifiedon,solutiontype&" +
@@ -210,13 +273,16 @@ function Collect-CEEnvironmentData {
         HasFOSolution       = $hasFO
         Notes               = @(
             if ($unmanaged.Count -gt 15) { "HIGH_UNMANAGED_SOLUTIONS ($($unmanaged.Count))" }
+            if ($managed.Count -eq 0 -and $activeUsers.Count -gt 0) {
+                'NO_MANAGED_SOLUTIONS - no managed solutions installed; all customizations are unmanaged indicating no ALM/deployment strategy'
+            }
         ) | Where-Object { $_ }
         TopUnmanaged        = @($unmanaged | Select-Object -First 10 -ExpandProperty uniquename)
     }
 
     # ── 5. Workflows / Cloud Flows ───────────────────────────────────────────
     $wfOData = "workflows?" +
-        "`$select=name,statecode,statuscode,category,type,createdon,modifiedon,clientdata&" +
+        "`$select=name,statecode,statuscode,category,type,createdon,modifiedon,clientdata,_ownerid_value&" +
         "`$filter=type eq 1 or type eq 2&" +   # definition workflows only (not templates)
         "`$orderby=modifiedon desc"
     $workflows = Invoke-DVSection -SectionName 'Workflows/Flows' `
@@ -230,14 +296,28 @@ function Collect-CEEnvironmentData {
     $modernFlows = @($workflows | Where-Object { $_.category -eq 5 })
     $bpf         = @($workflows | Where-Object { $_.category -eq 4 })
 
+    # Cross-reference active workflow/flow owners against the disabled users collected in section 1.
+    # A flow owned by a disabled account will stop working when its connection token expires.
+    $disabledUserIdSet = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($disabledUsers | ForEach-Object { $_.systemuserid } | Where-Object { $_ })
+    )
+    $activeWFsWithDisabledOwner = @($activeWFs | Where-Object {
+        $_._ownerid_value -and $disabledUserIdSet.Contains([string]$_._ownerid_value)
+    })
+
     $result.Sections['Workflows'] = @{
-        TotalCount      = if ($workflows) { @($workflows).Count } else { 0 }
-        ActiveCount     = $activeWFs.Count
-        InactiveCount   = $inactiveWFs.Count
-        ModernFlowCount = $modernFlows.Count
-        BPFCount        = $bpf.Count
-        Notes           = @(
+        TotalCount             = if ($workflows) { @($workflows).Count } else { 0 }
+        ActiveCount            = $activeWFs.Count
+        InactiveCount          = $inactiveWFs.Count
+        ModernFlowCount        = $modernFlows.Count
+        BPFCount               = $bpf.Count
+        ActiveOwnedByDisabled  = $activeWFsWithDisabledOwner.Count
+        DisabledOwnerFlowNames = @($activeWFsWithDisabledOwner | Select-Object -First 10 -ExpandProperty name)
+        Notes                  = @(
             if ($inactiveWFs.Count -gt 20) { "MANY_INACTIVE_WORKFLOWS ($($inactiveWFs.Count))" }
+            if ($activeWFsWithDisabledOwner.Count -gt 0) {
+                "ACTIVE_FLOWS_OWNED_BY_DISABLED_USERS ($($activeWFsWithDisabledOwner.Count) active flows/workflows owned by disabled accounts - connections will break when they expire)"
+            }
         ) | Where-Object { $_ }
     }
 
@@ -309,20 +389,66 @@ function Collect-CEEnvironmentData {
                                  -SaveFileName 'connection-references.json' `
                                  -Paginate
 
+    $connRefsArr      = @($connRefs)
+    # statecode 1 = Inactive; connection references become inactive when the underlying
+    # connection is deleted or the connector is removed — every flow using them will fail.
+    $inactiveConnRefs = @($connRefsArr | Where-Object { $_.statecode -eq 1 })
+
     $result.Sections['ConnectionReferences'] = @{
-        TotalCount = if ($connRefs) { @($connRefs).Count } else { 0 }
+        TotalCount    = $connRefsArr.Count
+        InactiveCount = $inactiveConnRefs.Count
+        InactiveNames = @($inactiveConnRefs | Select-Object -First 10 -ExpandProperty connectionreferencedisplayname)
+        Notes         = @(
+            if ($inactiveConnRefs.Count -gt 0) {
+                "BROKEN_CONNECTION_REFERENCES ($($inactiveConnRefs.Count) of $($connRefsArr.Count) connection references are inactive - all flows using these will fail)"
+            }
+        ) | Where-Object { $_ }
     }
 
     # ── 10. Environment Variables ─────────────────────────────────────────────
     $evOData = "environmentvariabledefinitions?" +
-        "`$select=displayname,schemaname,statecode,type,createdon,modifiedon"
+        "`$select=environmentvariabledefinitionid,displayname,schemaname,statecode,type,defaultvalue,createdon,modifiedon"
     $envVars = Invoke-DVSection -SectionName 'Environment Variables' `
                                 -ODataPath $evOData `
                                 -SaveFileName 'environment-variables.json' `
                                 -Paginate
 
+    # Cross-check which definitions have no current value AND no default value set.
+    # Components using an env var with no value and no default receive null at runtime.
+    Write-InventoryLog '    [Environment Variable Values]...' -Indent 2
+    $evVarsMissingValue = @()
+    try {
+        $evValResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                         -ODataPath "environmentvariablevalues?`$select=environmentvariablevalueid,_environmentvariabledefinitionid_value,value&`$top=500" `
+                         -TimeoutSec 60
+        $evValues = if ($evValResp.value) { $evValResp.value } else { @() }
+        Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'environment-variable-values.json' -Data $evValues
+
+        if (@($envVars).Count -gt 0) {
+            $defIdsWithValues = [System.Collections.Generic.HashSet[string]]::new(
+                [string[]]@($evValues | ForEach-Object { $_.'_environmentvariabledefinitionid_value' } | Where-Object { $_ })
+            )
+            # Flag definitions that have neither a current value record nor a default value
+            $evVarsMissingValue = @($envVars | Where-Object {
+                $_.environmentvariabledefinitionid -and
+                -not $defIdsWithValues.Contains([string]$_.environmentvariabledefinitionid) -and
+                (-not $_.defaultvalue -or $_.defaultvalue -eq '')
+            })
+        }
+        Write-InventoryLog "    -> $(@($evValues).Count) value records; $($evVarsMissingValue.Count) definitions have no value and no default." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Environment variable values query failed: $_" -Level WARN -Indent 3
+    }
+
     $result.Sections['EnvironmentVariables'] = @{
-        TotalCount = if ($envVars) { @($envVars).Count } else { 0 }
+        TotalCount        = if ($envVars) { @($envVars).Count } else { 0 }
+        MissingValueCount = $evVarsMissingValue.Count
+        MissingValueNames = @($evVarsMissingValue | Select-Object -First 10 -ExpandProperty displayname)
+        Notes             = @(
+            if ($evVarsMissingValue.Count -gt 0) {
+                "ENV_VARS_MISSING_VALUES ($($evVarsMissingValue.Count) environment variables have no current value and no default - components using these will receive null)"
+            }
+        ) | Where-Object { $_ }
     }
 
     # ── 11. Audit Log Sample (last 200 entries) ───────────────────────────────
@@ -374,6 +500,168 @@ function Collect-CEEnvironmentData {
         $result.Sections['RetentionPolicies'] = @{ TotalCount = 0; Notes = @('NOT_AVAILABLE') }
     }
 
+    # ── 12b. Mailbox / Server-Side Sync Health ──────────────────────────────
+    Write-InventoryLog '    [Mailbox / Server-Side Sync Health]...' -Indent 2
+    try {
+        $mailboxResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                           -ODataPath "mailboxes?`$select=name,emailaddress,statuscode,mailboxstatus,outgoingemailstatus,incomingemailstatus,testmailboxaccesscompletedon,mailboxtypecode,createdon,modifiedon&`$filter=statecode eq 0&`$top=500" `
+                           -TimeoutSec 90
+        $mailboxes = if ($mailboxResp.value) { $mailboxResp.value } else { @() }
+        Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'mailboxes.json' -Data $mailboxes
+
+        # mailboxstatus: 0=Not Run, 1=Success, 2=Failure
+        $errorMailboxes     = @($mailboxes | Where-Object { [int]$_.mailboxstatus -eq 2 })
+        $notTestedMailboxes = @($mailboxes | Where-Object { [int]$_.mailboxstatus -eq 0 -and -not $_.testmailboxaccesscompletedon })
+
+        $mailboxNotes = [System.Collections.Generic.List[string]]::new()
+        if ($errorMailboxes.Count -gt 0) {
+            $mailboxNotes.Add("MAILBOX_SYNC_ERRORS ($($errorMailboxes.Count) of $($mailboxes.Count) mailboxes in error state - email/appointment tracking broken)")
+        }
+        if ($notTestedMailboxes.Count -gt 5) {
+            $mailboxNotes.Add("MAILBOXES_NOT_TESTED ($($notTestedMailboxes.Count) mailboxes have never been tested for server-side sync access)")
+        }
+        if ($mailboxes.Count -eq 0 -and @($activeUsers).Count -gt 0) {
+            $mailboxNotes.Add("NO_MAILBOXES_CONFIGURED (no active mailboxes found but environment has $(@($activeUsers).Count) active users)")
+        }
+
+        $result.Sections['MailboxHealth'] = @{
+            TotalActive = $mailboxes.Count
+            InError     = $errorMailboxes.Count
+            NotTested   = $notTestedMailboxes.Count
+            ErrorNames  = @($errorMailboxes | Select-Object -First 10 -ExpandProperty emailaddress)
+            Notes       = @($mailboxNotes)
+        }
+        Write-InventoryLog "    -> $($mailboxes.Count) active mailboxes, $($errorMailboxes.Count) in error, $($notTestedMailboxes.Count) not tested." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Mailbox query failed: $_" -Level WARN -Indent 3
+        $result.Sections['MailboxHealth'] = @{ TotalActive = -1; Notes = @('QUERY_FAILED') }
+    }
+
+    # ── 12c. Unresolved Duplicate Records ───────────────────────────────────
+    Write-InventoryLog '    [Duplicate Record Backlog]...' -Indent 2
+    try {
+        $dupRecordResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                             -ODataPath "duplicaterecords?`$count=true&`$top=1&`$select=duplicateid" `
+                             -TimeoutSec 60
+        $dupRecordCount = if ($dupRecordResp.'@odata.count' -ne $null) { [int]$dupRecordResp.'@odata.count' } else { -1 }
+
+        $dupNotes = [System.Collections.Generic.List[string]]::new()
+        if ($dupRecordCount -gt 1000) {
+            $dupNotes.Add("HIGH_UNRESOLVED_DUPLICATES ($dupRecordCount unresolved duplicate record pairs - data quality degrading)")
+        } elseif ($dupRecordCount -gt 100) {
+            $dupNotes.Add("MANY_UNRESOLVED_DUPLICATES ($dupRecordCount unresolved duplicate record pairs)")
+        }
+
+        $result.Sections['DuplicateRecords'] = @{
+            UnresolvedCount = $dupRecordCount
+            Notes           = @($dupNotes)
+        }
+        Write-InventoryLog "    -> $dupRecordCount unresolved duplicate records." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Duplicate records query failed: $_" -Level WARN -Indent 3
+        $result.Sections['DuplicateRecords'] = @{ UnresolvedCount = -1; Notes = @() }
+    }
+
+    # ── 12d. Queue Item Backlog ─────────────────────────────────────────────
+    Write-InventoryLog '    [Queue Item Backlog]...' -Indent 2
+    try {
+        $queueItemResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                             -ODataPath "queueitems?`$count=true&`$top=1&`$select=queueitemid" `
+                             -TimeoutSec 60
+        $queueItemCount = if ($queueItemResp.'@odata.count' -ne $null) { [int]$queueItemResp.'@odata.count' } else { -1 }
+
+        $queueNotes = [System.Collections.Generic.List[string]]::new()
+        if ($queueItemCount -gt 5000) {
+            $queueNotes.Add("HIGH_QUEUE_ITEM_BACKLOG ($queueItemCount items in queues - may indicate routing or processing bottleneck)")
+        }
+
+        $result.Sections['QueueItems'] = @{
+            TotalCount = $queueItemCount
+            Notes      = @($queueNotes)
+        }
+        Write-InventoryLog "    -> $queueItemCount queue items." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Queue items query failed: $_" -Level WARN -Indent 3
+        $result.Sections['QueueItems'] = @{ TotalCount = -1; Notes = @() }
+    }
+
+    # ── 12e. Service Endpoint / Webhook Health ──────────────────────────────
+    Write-InventoryLog '    [Service Endpoints / Webhooks]...' -Indent 2
+    try {
+        $endpointResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                            -ODataPath "serviceendpoints?`$select=name,namespaceaddress,connectionmode,contract,authtype,createdon,modifiedon" `
+                            -TimeoutSec 60
+        $endpoints = if ($endpointResp.value) { $endpointResp.value } else { @() }
+        Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'service-endpoints.json' -Data $endpoints
+
+        # contract: 8=Webhook, 7=EventHub, 1=ServiceBus Queue, 2=ServiceBus Topic
+        $webhooks  = @($endpoints | Where-Object { [int]$_.contract -eq 8 })
+        $eventHubs = @($endpoints | Where-Object { [int]$_.contract -eq 7 })
+        $serviceBus = @($endpoints | Where-Object { [int]$_.contract -in @(1, 2) })
+
+        $result.Sections['ServiceEndpoints'] = @{
+            TotalCount      = $endpoints.Count
+            WebhookCount    = $webhooks.Count
+            EventHubCount   = $eventHubs.Count
+            ServiceBusCount = $serviceBus.Count
+            Notes           = @()
+        }
+        Write-InventoryLog "    -> $($endpoints.Count) service endpoints ($($webhooks.Count) webhooks, $($eventHubs.Count) event hubs, $($serviceBus.Count) service bus)." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Service endpoint query failed: $_" -Level WARN -Indent 3
+        $result.Sections['ServiceEndpoints'] = @{ TotalCount = -1; Notes = @() }
+    }
+
+    # ── 12f. SLA KPI Violations ─────────────────────────────────────────────
+    Write-InventoryLog '    [SLA KPI Violations]...' -Indent 2
+    try {
+        # status: 0=InProgress, 1=Noncompliant, 2=Noncompliant(Paused), 4=Succeeded, 5=Canceled
+        $slaResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                       -ODataPath "slakpiinstances?`$filter=(status eq 1 or status eq 2)&`$count=true&`$top=1&`$select=slakpiinstanceid" `
+                       -TimeoutSec 60
+        $slaViolationCount = if ($slaResp.'@odata.count' -ne $null) { [int]$slaResp.'@odata.count' } else { -1 }
+
+        $slaNotes = [System.Collections.Generic.List[string]]::new()
+        if ($slaViolationCount -gt 50) {
+            $slaNotes.Add("HIGH_SLA_VIOLATIONS ($slaViolationCount noncompliant SLA KPI instances - service level commitments being breached)")
+        }
+
+        $result.Sections['SLAViolations'] = @{
+            NoncompliantCount = $slaViolationCount
+            Notes             = @($slaNotes)
+        }
+        Write-InventoryLog "    -> $slaViolationCount noncompliant SLA KPI instances." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> SLA KPI query failed (SLAs may not be configured): $_" -Level WARN -Indent 3
+        $result.Sections['SLAViolations'] = @{ NoncompliantCount = -1; Notes = @() }
+    }
+
+    # ── 12g. Stale Process Instances ────────────────────────────────────────
+    # Active process sessions older than 180 days indicate abandoned BPF instances
+    # or stalled workflow sessions that will never complete.
+    Write-InventoryLog '    [Stale Process Instances (>180d)]...' -Indent 2
+    try {
+        $since180 = (Get-Date).AddDays(-180).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $staleProcResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                             -ODataPath "processsessions?`$filter=statecode eq 1 and createdon le $since180&`$count=true&`$top=1&`$select=activityid" `
+                             -TimeoutSec 60
+        $staleProcCount = if ($staleProcResp.'@odata.count' -ne $null) { [int]$staleProcResp.'@odata.count' } else { -1 }
+
+        $staleNotes = [System.Collections.Generic.List[string]]::new()
+        if ($staleProcCount -gt 500) {
+            $staleNotes.Add("STALE_BPF_INSTANCES ($staleProcCount active process sessions >180 days old - likely abandoned BPF instances inflating storage)")
+        }
+
+        $result.Sections['StaleProcessInstances'] = @{
+            StaleActiveCount = $staleProcCount
+            Notes            = @($staleNotes)
+        }
+        Write-InventoryLog "    -> $staleProcCount active process sessions older than 180 days." -Level OK -Indent 3
+    } catch {
+        Write-InventoryLog "    -> Stale process session query failed: $_" -Level WARN -Indent 3
+        $result.Sections['StaleProcessInstances'] = @{ StaleActiveCount = -1; Notes = @() }
+    }
+
     # ── 13. Process Sessions (flow run volume indicator) ─────────────────────
     Write-InventoryLog '    [Process Sessions - last 30d count]...' -Indent 2
     try {
@@ -388,6 +676,120 @@ function Collect-CEEnvironmentData {
         $result.Sections['ProcessSessions'] = @{ Last30dCount = -1 }
         Write-InventoryLog "    -> Could not count process sessions: $_" -Level WARN -Indent 3
     }
+
+    # ── 13b. Cleanup Table Health Indicators ─────────────────────────────────
+    # Targeted counts for high-volume tables that signal specific cleanup gaps.
+    # Each count is a read-only diagnostic query - no mutations performed.
+    Write-InventoryLog '    [Cleanup Table Health Indicators]...' -Indent 2
+    $cleanupHealthNotes = [System.Collections.Generic.List[string]]::new()
+
+    # WorkflowLog (WorkflowLogBase): old succeeded execution records accumulate when
+    # the parent AsyncOperation cleanup job isn't running. Cascade-deletes with parent.
+    $wfLogOldCount = -1
+    try {
+        $since30wf = (Get-Date).AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $wfLogR    = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                         -ODataPath "workflowlogs?`$filter=status eq 2 and createdon le $since30wf&`$count=true&`$top=1&`$select=activityid" `
+                         -TimeoutSec 60
+        $wfLogOldCount = if ($wfLogR.'@odata.count' -ne $null) { [int]$wfLogR.'@odata.count' } else { -1 }
+        if ($wfLogOldCount -gt 50000) {
+            $cleanupHealthNotes.Add("OLD_WORKFLOW_LOGS_ACCUMULATING ($wfLogOldCount succeeded WorkflowLog records >30d - async operation cleanup may not be running)")
+        }
+    } catch {
+        Write-InventoryLog "    -> WorkflowLog count failed: $_" -Level WARN -Indent 3
+    }
+
+    # PluginTraceLog (PluginTraceLogBase): any records indicate trace logging was/is active.
+    # Consumes Log storage. Should be Off in production (confirmed via OrgSettings above).
+    # Built-in recurring job deletes records >1 day old when logging is active.
+    $pluginTraceLogCount = -1
+    try {
+        $ptlR = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                    -ODataPath "plugintracelogs?`$count=true&`$top=1&`$select=plugintraceid" `
+                    -TimeoutSec 60
+        $pluginTraceLogCount = if ($ptlR.'@odata.count' -ne $null) { [int]$ptlR.'@odata.count' } else { -1 }
+        if ($pluginTraceLogCount -gt 5000) {
+            $cleanupHealthNotes.Add("PLUGIN_TRACE_LOGS_ACCUMULATING ($pluginTraceLogCount records - verify recurring cleanup job is active and trace logging is disabled in production)")
+        }
+    } catch {
+        Write-InventoryLog "    -> PluginTraceLog count failed: $_" -Level WARN -Indent 3
+    }
+
+    # Annotation (AnnotationBase / Notes): records with large file attachments are top
+    # File storage consumers. Create a bulk delete job targeting large/old notes.
+    $largeAnnotationCount = -1
+    try {
+        $annotR = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                      -ODataPath "annotations?`$filter=filesizeinbytes gt 1048576&`$count=true&`$top=1&`$select=annotationid" `
+                      -TimeoutSec 60
+        $largeAnnotationCount = if ($annotR.'@odata.count' -ne $null) { [int]$annotR.'@odata.count' } else { -1 }
+        if ($largeAnnotationCount -gt 500) {
+            $cleanupHealthNotes.Add("LARGE_ANNOTATION_FILES ($largeAnnotationCount notes with >1 MB attachments - significant file storage consumer; consider bulk delete job for old attachments)")
+        }
+    } catch {
+        Write-InventoryLog "    -> Annotation large-file count failed: $_" -Level WARN -Indent 3
+    }
+
+    # Email activities (EmailBase): completed emails older than 90 days consume significant
+    # database storage (EmailBase, EmailHashBase, ActivityPartyBase, ActivityPointerBase).
+    # Recommend a recurring bulk deletion job: statecode=1 AND actualend < 90 days ago.
+    $oldEmailCount = -1
+    try {
+        $since90em = (Get-Date).AddDays(-90).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $emailR    = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                         -ODataPath "emails?`$filter=statecode eq 1 and actualend le $since90em&`$count=true&`$top=1&`$select=activityid" `
+                         -TimeoutSec 60
+        $oldEmailCount = if ($emailR.'@odata.count' -ne $null) { [int]$emailR.'@odata.count' } else { -1 }
+        if ($oldEmailCount -gt 10000) {
+            $cleanupHealthNotes.Add("OLD_COMPLETED_EMAILS ($oldEmailCount completed email activities >90d - consider a recurring bulk delete job: statecode=1 AND actualend <90d ago)")
+        }
+    } catch {
+        Write-InventoryLog "    -> Email activity count failed: $_" -Level WARN -Indent 3
+    }
+
+    # ImportJob (ImportJobBase): completed import history records older than 90 days.
+    # Recommend a bulk delete job: System Job Type = Import AND Completed On > 90 days ago.
+    $oldImportCount = -1
+    try {
+        $since90im = (Get-Date).AddDays(-90).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $importR   = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                         -ODataPath "importjobs?`$filter=completedon le $since90im&`$count=true&`$top=1&`$select=importjobid" `
+                         -TimeoutSec 60
+        $oldImportCount = if ($importR.'@odata.count' -ne $null) { [int]$importR.'@odata.count' } else { -1 }
+        if ($oldImportCount -gt 50) {
+            $cleanupHealthNotes.Add("OLD_IMPORT_JOB_HISTORY ($oldImportCount import job records >90d - no cleanup bulk deletion job found; create one: System Job Type = Import AND Completed On older than 90 days)")
+        }
+    } catch {
+        Write-InventoryLog "    -> ImportJob count failed: $_" -Level WARN -Indent 3
+    }
+
+    # BulkDeleteOperation (BulkDeleteOperationBase): history of past bulk delete runs.
+    # The records themselves are small, but if never cleaned up they indicate no self-cleanup job.
+    $oldBulkDeleteOpCount = -1
+    try {
+        $since90bd  = (Get-Date).AddDays(-90).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $bulkDelOpR = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
+                          -ODataPath "bulkdeleteoperations?`$filter=statecode eq 3 and completedon le $since90bd&`$count=true&`$top=1&`$select=bulkdeleteoperationid" `
+                          -TimeoutSec 60
+        $oldBulkDeleteOpCount = if ($bulkDelOpR.'@odata.count' -ne $null) { [int]$bulkDelOpR.'@odata.count' } else { -1 }
+        if ($oldBulkDeleteOpCount -gt 100) {
+            $cleanupHealthNotes.Add("OLD_BULK_DELETE_OPERATION_HISTORY ($oldBulkDeleteOpCount completed bulk delete operation records >90d - create a self-cleaning bulk delete job: System Job Type = Bulk Delete AND Completed On older than 90 days)")
+        }
+    } catch {
+        Write-InventoryLog "    -> BulkDeleteOperation count failed: $_" -Level WARN -Indent 3
+    }
+
+    $result.Sections['CleanupTableHealth'] = @{
+        WorkflowLogOldSucceeded  = $wfLogOldCount
+        PluginTraceLogTotal      = $pluginTraceLogCount
+        LargeAnnotations         = $largeAnnotationCount
+        OldCompletedEmails       = $oldEmailCount
+        OldImportJobRecords      = $oldImportCount
+        OldBulkDeleteOpRecords   = $oldBulkDeleteOpCount
+        Notes                    = @($cleanupHealthNotes)
+    }
+    Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'cleanup-table-health.json' -Data $result.Sections['CleanupTableHealth']
+    Write-InventoryLog "    -> WFLog(>30d): $wfLogOldCount | TraceLog: $pluginTraceLogCount | LargeAnnotations(>1MB): $largeAnnotationCount | OldEmails(>90d): $oldEmailCount | OldImports(>90d): $oldImportCount | OldBulkDelOps(>90d): $oldBulkDeleteOpCount" -Level OK -Indent 3
 
     # ── 14. Entity / Table Statistics ────────────────────────────────────────
     Write-InventoryLog '    [Entity Definitions]...' -Indent 2
@@ -422,10 +824,24 @@ function Collect-CEEnvironmentData {
 
             # Prioritize: custom entities + known high-volume OOB entities
             $priorityOOB = @(
-                'activitypointer','annotation','email','task','phonecall','appointment',
-                'systemjob','asyncoperation','bulkoperationlog','duplicaterecord',
-                'principalobjectaccess','userentityinstancedata','tracing',
-                'auditbase','activityparty','queueitem','connection'
+                # Core activity / communication tables (top database storage consumers)
+                'activitypointer','email','appointment','task','phonecall','activityparty',
+                # Notes / attachments (top file storage consumers)
+                'annotation',
+                # Async / system jobs (fastest-growing tables; cleanup critical)
+                'asyncoperation','workflowlog',
+                # Cleanup / bulk operation history
+                'bulkdeleteoperation','bulkoperationlog','importjob',
+                # Logging tables (Log storage)
+                'plugintracelog','tracelog',
+                # Sharing / access control (can grow extremely large with heavy sharing)
+                'principalobjectaccess',
+                # Duplicates / user data
+                'duplicaterecord','userentityinstancedata',
+                # Queue / connection objects
+                'queueitem','connection',
+                # Server-side sync mapping (grows with Exchange sync usage)
+                'exchangesyncidmapping'
             )
 
             $toCount = [System.Collections.Generic.List[object]]::new()
@@ -466,12 +882,16 @@ function Collect-CEEnvironmentData {
             Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'entity-counts.json' -Data $sorted
 
             $largeCustom = @($sorted | Where-Object { $_.IsCustom -and $_.RecordCount -gt 100000 })
+            # Teams-linked tables (Dataverse for Teams) have strict 2 GB storage limits
+            $teamsLargeEntities = @($sorted | Where-Object { $_.LogicalName -like 'msteams_*' -and $_.RecordCount -gt 10000 })
             $result.Sections['EntityCounts'] = @{
-                CountedEntities     = $sorted.Count
-                TopByRecordCount    = @($sorted | Select-Object -First 10)
-                LargeCustomEntities = $largeCustom
-                Notes               = @(
+                CountedEntities      = $sorted.Count
+                TopByRecordCount     = @($sorted | Select-Object -First 10)
+                LargeCustomEntities  = $largeCustom
+                TeamsLargeEntities   = $teamsLargeEntities
+                Notes                = @(
                     if ($largeCustom.Count -gt 0) { "LARGE_CUSTOM_ENTITIES_NO_CLEANUP ($($largeCustom.Count) entities >100k rows)" }
+                    if ($teamsLargeEntities.Count -gt 0) { "TEAMS_TABLE_STORAGE_HIGH ($($teamsLargeEntities.Count) Teams-linked tables with >10k records - Dataverse for Teams has strict 2 GB storage limit)" }
                 ) | Where-Object { $_ }
             }
             Write-InventoryLog "    -> Record counts collected for $($sorted.Count) entities." -Level OK -Indent 3
