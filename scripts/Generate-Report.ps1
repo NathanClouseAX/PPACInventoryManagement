@@ -621,6 +621,96 @@ foreach ($e in $foEnvs) {
 "@
 }
 
+# ── Per-env Top 25 Tables by Record Count (storage concentration proxy) ──────
+# Microsoft does not expose per-table bytes via any public Dataverse/F&O API.
+# Record count from RetrieveTotalRecordCount is the documented signal we can get,
+# so we surface it here as a proxy for where the data lives in each environment.
+# Only populated when -IncludeEntityCounts was used during collection.
+$topTablesEnvCards = ''
+$envsWithCounts    = [System.Collections.Generic.List[PSObject]]::new()
+
+foreach ($envEntry in $master.Environments) {
+    if (-not $envEntry.OutputDir) { continue }
+    $countsFile = Join-Path $envEntry.OutputDir 'entity-counts.json'
+    if (-not (Test-Path $countsFile)) { continue }
+
+    $counts = Get-Content $countsFile -Raw | ConvertFrom-Json
+    if (-not $counts) { continue }
+    $countsArr = @($counts)
+    if ($countsArr.Count -eq 0) { continue }
+
+    $top25       = @($countsArr | Sort-Object -Property RecordCount -Descending | Select-Object -First 25)
+    $totalTop25  = ($top25     | Measure-Object -Property RecordCount -Sum).Sum
+    $totalAll    = ($countsArr | Measure-Object -Property RecordCount -Sum).Sum
+
+    $envsWithCounts.Add([PSCustomObject]@{
+        EnvironmentId = $envEntry.EnvironmentId
+        DisplayName   = $envEntry.DisplayName
+        Sku           = $envEntry.EnvironmentSku
+        Top25         = $top25
+        TotalTop25    = [int64]($totalTop25 | ForEach-Object { if ($null -eq $_) { 0 } else { $_ } })
+        TotalAll      = [int64]($totalAll   | ForEach-Object { if ($null -eq $_) { 0 } else { $_ } })
+        CountedTables = $countsArr.Count
+    })
+}
+
+# Sort envs by total records across counted tables (data-heaviest first)
+$envsWithCountsSorted = @($envsWithCounts | Sort-Object -Property TotalAll -Descending)
+
+foreach ($envInfo in $envsWithCountsSorted) {
+    $nameEsc    = [System.Web.HttpUtility]::HtmlEncode([string]$envInfo.DisplayName)
+    $envIdSafe  = ($envInfo.EnvironmentId -replace '[^a-zA-Z0-9]', '_')
+    $skuEsc     = [System.Web.HttpUtility]::HtmlEncode([string]$envInfo.Sku)
+    $totalFmt   = '{0:N0}' -f $envInfo.TotalAll
+    $top25Fmt   = '{0:N0}' -f $envInfo.TotalTop25
+    $tableCount = $envInfo.CountedTables
+
+    $rows = ''
+    $rank = 0
+    foreach ($t in $envInfo.Top25) {
+        $rank++
+        $ln = [System.Web.HttpUtility]::HtmlEncode([string]$t.LogicalName)
+        $dnRaw = if ($t.DisplayName) { [string]$t.DisplayName } else { [string]$t.LogicalName }
+        $dn = [System.Web.HttpUtility]::HtmlEncode($dnRaw)
+        $typeBadge = if ($t.IsCustom) {
+            "<span class='badge bg-info text-dark'>Custom</span>"
+        } else {
+            "<span class='badge bg-secondary'>OOB</span>"
+        }
+        $rc = [int64]$t.RecordCount
+        $rcFmt = '{0:N0}' -f $rc
+        $rows += "<tr><td>$rank</td><td><code>$ln</code></td><td><small>$dn</small></td><td>$typeBadge</td><td class='text-end fw-bold'>$rcFmt</td></tr>"
+    }
+
+    $topTablesEnvCards += @"
+<div class='card mb-2'>
+  <div class='card-header bg-light p-2'>
+    <button class='btn btn-link text-decoration-none p-0 fw-bold text-start' data-bs-toggle='collapse' data-bs-target='#tt_$envIdSafe'>
+      $nameEsc <small class='text-muted fw-normal'>($skuEsc) &mdash; $tableCount tables counted, $totalFmt total records (top-25: $top25Fmt)</small>
+    </button>
+  </div>
+  <div id='tt_$envIdSafe' class='collapse'>
+    <div class='card-body p-0'>
+      <table class='table table-sm table-striped mb-0'>
+        <thead class='table-dark'>
+          <tr><th style='width:50px'>#</th><th>Logical Name</th><th>Display Name</th><th>Type</th><th class='text-end' style='width:140px'>Record Count</th></tr>
+        </thead>
+        <tbody>$rows</tbody>
+      </table>
+    </div>
+  </div>
+</div>
+"@
+}
+
+if ($envsWithCountsSorted.Count -eq 0) {
+    $topTablesEnvCards = @"
+<div class='alert alert-info mb-0'>
+  No entity record counts were collected. Re-run the inventory with <code>-IncludeEntityCounts</code> to populate this section.
+</div>
+"@
+}
+
 # ── Storage cleanup recommendations ───────────────────────────────────────────
 # Synthesizes CleanupTableHealth, AsyncOperations, and OrgSettings data from the
 # CE collector into per-environment, ranked, actionable cleanup recommendations.
@@ -844,6 +934,7 @@ $html = @"
         <a href="#storage-cleanup">Cleanup Recommendations</a>
         <a href="#activity">Activity / Unused</a>
         <a href="#fo-section">Finance & Operations</a>
+        <a href="#top-tables">Top Tables (Records)</a>
         <a href="#run-info">Collection Info</a>
       </div>
     </div>
@@ -1144,10 +1235,10 @@ $(
 <section id="fo-section" class="mb-5">
   <div class="section-header"><h5 class="mb-0">Finance &amp; Operations Environments ($envsWithFO detected)</h5></div>
   $(if ($envsWithFO -eq 0) {
-      "<p class='text-muted'>No Finance &amp; Operations solutions were detected in any environment.</p>"
+      "<p class='text-muted'>No Finance &amp; Operations integration was detected in any environment.</p>"
   } else {
     @"
-  <p class='text-muted small'>Environments where FO solutions (Dual-Write, Dynamics 365 Finance, Supply Chain, etc.) were detected.</p>
+  <p class='text-muted small'>Environments where Finance &amp; Operations integration was detected via the Dataverse RetrieveFinanceAndOperationsIntegrationDetails action.</p>
   <table id='foTable' class='table table-sm table-hover table-bordered' style='width:100%'>
     <thead class='table-dark'>
       <tr>
@@ -1166,6 +1257,19 @@ $(
   </table>
 "@
   })
+</section>
+
+<!-- TOP TABLES BY RECORD COUNT (storage concentration proxy) -->
+<section id="top-tables" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Top 25 Tables by Record Count (per environment)</h5></div>
+  <p class='text-muted small'>
+    Microsoft doesn't expose per-table storage bytes via any public Dataverse or Finance &amp; Operations API &mdash;
+    only tenant/environment totals (BAP admin API) and a UI-only drill-down in PPAC.
+    Record count from the documented <code>RetrieveTotalRecordCount</code> function is the closest signal we can collect,
+    and it's a reasonable proxy for storage concentration: the tables with the most rows almost always dominate database storage for an environment.
+    Populated only when the inventory is run with <code>-IncludeEntityCounts</code>.
+  </p>
+  $topTablesEnvCards
 </section>
 
 <!-- COLLECTION INFO -->

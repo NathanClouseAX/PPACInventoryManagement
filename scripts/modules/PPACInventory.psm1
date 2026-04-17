@@ -410,36 +410,89 @@ function Get-DataverseEntityCount {
     }
 }
 
-# ── FO detection helpers ───────────────────────────────────────────────────────
+# ── F&O integration detection ──────────────────────────────────────────────────
 
-$script:FOSolutionPatterns = @(
-    'Dynamics365FinanceOperationsExtended',
-    'DualWriteCore',
-    'DualWriteFinance',
-    'DualWriteSupplyChain',
-    'DualWriteHumanResources',
-    'DualWriteProject',
-    'DualWriteAssetManagement',
-    'DualWriteParty',
-    'DualWriteNotes',
-    'msdyn_FinanceAndOperationsExtended',
-    'Dynamics365Finance',
-    'Dynamics365SupplyChainManagement'
-)
-
-function Test-HasFOSolution {
+function Get-FOIntegrationDetails {
     <#
-    .SYNOPSIS  Returns $true if any installed solution matches an FO pattern.
-    #>
-    param([object[]]$Solutions)
+    .SYNOPSIS
+        Authoritative Finance & Operations integration check for a Dataverse
+        environment. Calls the Dataverse Web API unbound function
+        RetrieveFinanceAndOperationsIntegrationDetails — the same API Microsoft
+        recommends for verifying Power Platform integration at runtime.
+    .DESCRIPTION
+        When the Dataverse org is linked to an F&O environment, the action
+        returns the F&O URL plus tenant/environment IDs. When it isn't linked,
+        the API returns error code 0x80048d0b ("Dataverse instance isn't
+        integrated with finance and operations.") — we treat that as a normal
+        "no F&O" result rather than an error.
 
-    foreach ($sol in $Solutions) {
-        $name = $sol.uniquename
-        foreach ($pattern in $script:FOSolutionPatterns) {
-            if ($name -like "*$pattern*") { return $true }
-        }
+        Any other failure (403/404/timeout) is logged and returns HasFO=$false
+        so downstream collection is skipped conservatively.
+    .LINK
+        https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/reference/retrievefinanceandoperationsintegrationdetailsresponse
+    .LINK
+        https://learn.microsoft.com/en-us/dynamics365/fin-ops-core/dev-itpro/power-platform/enable-power-platform-integration
+    .OUTPUTS
+        Hashtable with keys: HasFO, FOUrl, FOEnvironmentId, FOTenantId,
+        IsUnifiedDatabase, OrgLifecycleStatus.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$InstanceApiUrl,
+        [string]$InstanceUrl = '',
+        [int]   $TimeoutSec  = 60
+    )
+
+    $notIntegrated = @{
+        HasFO              = $false
+        FOUrl              = $null
+        FOEnvironmentId    = $null
+        FOTenantId         = $null
+        IsUnifiedDatabase  = $false
+        OrgLifecycleStatus = $null
     }
-    return $false
+
+    try {
+        $resp = Invoke-DataverseRequest `
+            -InstanceApiUrl $InstanceApiUrl `
+            -InstanceUrl    $InstanceUrl `
+            -ODataPath      'RetrieveFinanceAndOperationsIntegrationDetails' `
+            -TimeoutSec     $TimeoutSec
+    } catch {
+        $raw = ''
+        try { $raw = $_.ErrorDetails.Message } catch {}
+        if (-not $raw) { $raw = $_.Exception.Message }
+
+        if ($raw -match '0x80048d0b' -or $raw -match "isn't integrated with finance and operations") {
+            return $notIntegrated
+        }
+
+        Write-InventoryLog "RetrieveFinanceAndOperationsIntegrationDetails failed: $raw" -Level WARN -Indent 2
+        return $notIntegrated
+    }
+
+    if (-not $resp) { return $notIntegrated }
+
+    # Strict-mode-safe property access: unbound-function responses are PSCustomObject.
+    $getProp = {
+        param($obj, $name)
+        if ($null -eq $obj) { return $null }
+        $p = $obj.PSObject.Properties[$name]
+        if ($p) { return $p.Value }
+        return $null
+    }
+
+    $url = & $getProp $resp 'Url'
+    if (-not $url) { return $notIntegrated }
+
+    return @{
+        HasFO              = $true
+        FOUrl              = [string]$url
+        FOEnvironmentId    = [string](& $getProp $resp 'Id')
+        FOTenantId         = [string](& $getProp $resp 'TenantId')
+        IsUnifiedDatabase  = [bool]  (& $getProp $resp 'IsUnifiedDatabase')
+        OrgLifecycleStatus = [string](& $getProp $resp 'OrgLifecycleStatus')
+    }
 }
 
 Export-ModuleMember -Function @(
@@ -454,6 +507,6 @@ Export-ModuleMember -Function @(
     'Save-RootData'
     'Get-SafeDirectoryName'
     'Get-DataverseEntityCount'
-    'Test-HasFOSolution'
+    'Get-FOIntegrationDetails'
     'Invoke-RestWithRetry'
 )

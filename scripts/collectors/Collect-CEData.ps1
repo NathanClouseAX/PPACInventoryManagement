@@ -26,6 +26,7 @@ function Collect-CEEnvironmentData {
         [Parameter(Mandatory)]
         [hashtable]$EnvEntry,         # From Get-AllEnvironments
         [string]$EnvOutputDir,        # Directory to save JSON files into
+        [bool]  $HasFO = $false,      # Supplied by orchestrator from Get-FOIntegrationDetails
         [switch]$IncludeEntityCounts, # Whether to fetch record counts (slow)
         [int]$EntityCountTop = 150    # How many entities to count (sorted by est. importance)
     )
@@ -47,7 +48,7 @@ function Collect-CEEnvironmentData {
         DisplayName       = $displayName
         OrgUrl            = $instanceUrl
         OrgApiUrl         = $apiUrl
-        HasFO             = $false
+        HasFO             = $HasFO
         Sections          = [ordered]@{}
     }
 
@@ -261,16 +262,10 @@ function Collect-CEEnvironmentData {
     $managed   = @($solutions | Where-Object { $_.ismanaged -eq $true })
     $unmanaged = @($solutions | Where-Object { $_.ismanaged -eq $false })
 
-    # FO detection via solutions
-    $hasFO = $false
-    if ($solutions) { $hasFO = Test-HasFOSolution -Solutions $solutions }
-    $result.HasFO = $hasFO
-
     $result.Sections['Solutions'] = @{
         TotalCount          = if ($solutions) { @($solutions).Count } else { 0 }
         ManagedCount        = $managed.Count
         UnmanagedCount      = $unmanaged.Count
-        HasFOSolution       = $hasFO
         Notes               = @(
             if ($unmanaged.Count -gt 15) { "HIGH_UNMANAGED_SOLUTIONS ($($unmanaged.Count))" }
             if ($managed.Count -eq 0 -and $activeUsers.Count -gt 0) {
@@ -902,7 +897,7 @@ function Collect-CEEnvironmentData {
     }
 
     # ── 15. Dual-Write Configuration (FO link indicator) ─────────────────────
-    if ($hasFO) {
+    if ($HasFO) {
         Write-InventoryLog '    [Dual-Write Configuration]...' -Indent 2
         try {
             $dwResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `

@@ -11,7 +11,8 @@
       - Storage size indicators via entity record counts
       - Scheduled cleanup jobs specific to FO
 
-    FO AOS URL is derived from dual-write config or must be passed directly.
+    FO AOS URL must be supplied by the caller — the orchestrator obtains it
+    from the Dataverse RetrieveFinanceAndOperationsIntegrationDetails action.
 
     This script is dot-sourced by Invoke-DataverseInventory.ps1.
 .NOTES
@@ -25,52 +26,16 @@ function Collect-FOEnvironmentData {
         [Parameter(Mandatory)]
         [hashtable]$EnvEntry,       # From Get-AllEnvironments
         [string]$EnvOutputDir,      # Directory to save JSON files into
-        [string]$FOBaseUrl = ''     # e.g. https://myenv.cloudax.dynamics.com
-                                    # If empty, attempts auto-detection
+        [Parameter(Mandatory)]
+        [string]$FOBaseUrl          # F&O AOS URL from Get-FOIntegrationDetails
     )
 
     $displayName = $EnvEntry.DisplayName
 
     Write-InventoryLog "  Starting FO data collection for: $displayName" -Indent 1
 
-    # ── Resolve FO URL ────────────────────────────────────────────────────────
     if (-not $FOBaseUrl) {
-        # Try to read from saved dual-write config
-        $dwConfigFile = Join-Path $EnvOutputDir 'dualwrite-configs.json'
-        if (Test-Path $dwConfigFile) {
-            try {
-                $dwConfigs = Get-Content $dwConfigFile -Raw | ConvertFrom-Json
-                foreach ($cfg in $dwConfigs) {
-                    # The AOS URL is often stored in the name or a related field
-                    if ($cfg.msdyn_name -match 'https://') {
-                        $FOBaseUrl = ($cfg.msdyn_name | Select-String -Pattern 'https://[^\s,]+').Matches[0].Value
-                        break
-                    }
-                }
-            } catch {}
-        }
-
-        # Try to get from BAP (FO-type linked environment)
-        if (-not $FOBaseUrl) {
-            try {
-                $envDetail = Invoke-BAPRequest `
-                    -Path "/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/$($EnvEntry.EnvironmentId)" `
-                    -ApiVersion '2021-04-01'
-                $linkedApps = $envDetail.properties.linkedD365AppsMetadata
-                if ($linkedApps) {
-                    foreach ($app in $linkedApps) {
-                        if ($app.type -in 'Dynamics365Operations', 'Finance', 'FinanceAndOperations') {
-                            $FOBaseUrl = $app.instanceUrl
-                            break
-                        }
-                    }
-                }
-            } catch {}
-        }
-    }
-
-    if (-not $FOBaseUrl) {
-        Write-InventoryLog "  Could not determine FO AOS URL - skipping FO collection." -Level WARN -Indent 1
+        Write-InventoryLog "  No FO AOS URL supplied - skipping FO collection." -Level WARN -Indent 1
         $result = @{
             CollectedAt   = (Get-Date -Format 'o')
             DisplayName   = $displayName

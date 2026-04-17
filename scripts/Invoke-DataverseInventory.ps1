@@ -7,16 +7,25 @@
     This is the main orchestrator script. It:
       1. Authenticates to the tenant using the Az module (interactive or device code)
       2. Enumerates all Power Platform environments via the BAP API
-      3. For each environment that has a Dataverse org, collects:
+      3. For each environment that has a Dataverse org, calls the Dataverse
+         action RetrieveFinanceAndOperationsIntegrationDetails to determine
+         whether the environment is linked to a Finance & Operations app, and
+         records the F&O URL / environment ID / tenant ID when it is.
+      4. Then collects CE-side data:
            - Storage capacity (BAP API)
            - System users, bulk delete jobs, async ops, solutions, workflows,
              plugins, duplicate detection rules, app modules, audit samples,
-             retention policies, entity statistics (CE side)
-      4. For environments with Finance & Operations solutions detected,
-         additionally collects FO batch jobs, DIXF history, users, and legal entities
-      5. Saves everything as structured JSON under -OutputPath
+             retention policies, entity statistics
+      5. For environments with F&O integration detected, additionally collects
+         FO batch jobs, DIXF history, users, and legal entities (unless
+         -IncludeFO:$false is passed).
+      6. Saves everything as structured JSON under -OutputPath
 
     All operations are READ-ONLY. No changes are made to any environment.
+
+    By default, the script collects everything available: entity record counts
+    (-IncludeEntityCounts) and F&O data (-IncludeFO) are both on. Pass
+    -IncludeEntityCounts:$false or -IncludeFO:$false to skip those stages.
 
 .PARAMETER OutputPath
     Root directory where collected data will be stored.
@@ -36,17 +45,22 @@
     Array of environment GUIDs to skip. Useful for known test environments.
 
 .PARAMETER IncludeEntityCounts
-    If specified, fetches record counts for up to -EntityCountTop entities per
-    Dataverse org. This adds significant time for large tenants.
+    Fetch record counts for up to -EntityCountTop entities per Dataverse org.
+    Default: $true. Adds significant time for large tenants; pass
+    -IncludeEntityCounts:$false to skip.
 
 .PARAMETER EntityCountTop
     How many entities to count per environment when -IncludeEntityCounts is used.
     Default: 150
 
 .PARAMETER IncludeFO
-    If specified, collects Finance & Operations data for environments where FO solutions
-    are detected. Requires the authenticated user to have the System Administrator role
-    in each FO environment.
+    Collect Finance & Operations data (batch jobs, DIXF history, users, legal
+    entities) for environments where F&O integration is detected via the Dataverse
+    RetrieveFinanceAndOperationsIntegrationDetails action. Detection itself always
+    runs; this flag only gates the deeper F&O AOS queries. Requires the
+    authenticated user to have the System Administrator role in each F&O
+    environment.
+    Default: $true. Pass -IncludeFO:$false to skip.
 
 .PARAMETER MaxEnvironments
     Safety limit - stops after processing this many environments. 0 = no limit.
@@ -60,12 +74,16 @@
     Force device-code authentication flow instead of interactive browser login.
 
 .EXAMPLE
-    # Full collection, interactive login
+    # Full collection, interactive login (entity counts and F&O data are on by default)
     .\Invoke-DataverseInventory.ps1 -OutputPath C:\PPACData
 
 .EXAMPLE
-    # Include entity record counts and FO data
-    .\Invoke-DataverseInventory.ps1 -OutputPath C:\PPACData -IncludeEntityCounts -IncludeFO
+    # Fast run: skip the slow per-entity record counts
+    .\Invoke-DataverseInventory.ps1 -OutputPath C:\PPACData -IncludeEntityCounts:$false
+
+.EXAMPLE
+    # Skip F&O collection (no System Administrator role in F&O envs)
+    .\Invoke-DataverseInventory.ps1 -OutputPath C:\PPACData -IncludeFO:$false
 
 .EXAMPLE
     # Only production environments, resume if partially run
@@ -83,9 +101,9 @@ param(
     [string]  $SubscriptionId      = '',
     [string]  $EnvironmentFilter   = '',
     [string[]]$SkipEnvironmentIds  = @(),
-    [switch]  $IncludeEntityCounts,
+    [switch]  $IncludeEntityCounts  = $true,
     [int]     $EntityCountTop       = 150,
-    [switch]  $IncludeFO,
+    [switch]  $IncludeFO             = $true,
     [int]     $MaxEnvironments      = 0,
     [switch]  $Force,
     [switch]  $UseDeviceCode
@@ -218,16 +236,41 @@ foreach ($env in $environments) {
     Write-InventoryLog "  ID: $envId" -Indent 1
     Write-InventoryLog "  State: $($env.State) | Runtime: $($env.RuntimeState)" -Indent 1
 
-    # Resume support: if ce-summary.json already exists and -Force was not specified,
-    # skip re-collection to allow resuming an interrupted run. We still load the
-    # existing summary so it appears correctly in the final report and delta comparison.
-    $ceSummaryFile = Join-Path $envOutputDir 'ce-summary.json'
+    # Resume support: skip re-collection only if ce-summary.json exists AND all
+    # requested outputs from the current run are already present. Missing outputs
+    # (e.g., entity-counts.json when -IncludeEntityCounts is on, or F&O details
+    # when -IncludeFO is on and the prior summary didn't record HasFO) trigger
+    # a re-collection for that environment so the report gets the new sections.
+    $ceSummaryFile    = Join-Path $envOutputDir 'ce-summary.json'
+    $entityCountsFile = Join-Path $envOutputDir 'entity-counts.json'
+    $foDetailsFile    = Join-Path $envOutputDir 'fo-integration-details.json'
+    $shouldSkip = $false
+    $existingCE = $null
     if (-not $Force -and (Test-Path $ceSummaryFile)) {
+        $shouldSkip = $true
+        try { $existingCE = Get-Content $ceSummaryFile -Raw | ConvertFrom-Json } catch { $shouldSkip = $false }
+
+        if ($shouldSkip -and $IncludeEntityCounts -and -not (Test-Path $entityCountsFile)) {
+            Write-InventoryLog "  Entity counts missing - re-collecting." -Level INFO -Indent 1
+            $shouldSkip = $false
+        }
+        if ($shouldSkip -and $IncludeFO -and $existingCE) {
+            $hasFOProp = $existingCE.PSObject.Properties.Name -contains 'HasFO'
+            if (-not $hasFOProp) {
+                Write-InventoryLog "  F&O detection not run in prior pass - re-collecting." -Level INFO -Indent 1
+                $shouldSkip = $false
+            } elseif ($existingCE.HasFO -eq $true -and -not (Test-Path $foDetailsFile)) {
+                Write-InventoryLog "  F&O details file missing - re-collecting." -Level INFO -Indent 1
+                $shouldSkip = $false
+            }
+        }
+    }
+
+    if ($shouldSkip) {
         Write-InventoryLog "  Already collected (use -Force to overwrite). Skipping." -Level SKIP -Indent 1
         $skippedCount++
         # Re-hydrate just enough fields for the report (storage comes from live env list, not cached summary)
         try {
-            $existingCE = Get-Content $ceSummaryFile -Raw | ConvertFrom-Json
             $envEntry = @{
                 EnvironmentId    = $envId
                 DisplayName      = $displayName
@@ -241,6 +284,7 @@ foreach ($env in $environments) {
                 StorageTotal_MB  = $env.StorageTotal_MB
                 HasDataverse     = $env.HasDataverse
                 HasFO            = if ($existingCE.HasFO) { $existingCE.HasFO } else { $false }
+                FOBaseUrl        = if ($existingCE.FOBaseUrl) { $existingCE.FOBaseUrl } else { $null }
                 AllFlags         = if ($existingCE.AllFlags) { $existingCE.AllFlags } else { @() }
                 OutputDir        = $envOutputDir
                 Skipped          = $true
@@ -264,8 +308,9 @@ foreach ($env in $environments) {
     Save-EnvironmentData -EnvironmentDir $envOutputDir -FileName 'metadata.json' -Data $env
 
     # Build the per-environment summary entry that flows into master-summary.json
-    # and is read by Generate-Report.ps1. Fields come from both the BAP environment
-    # list (storage, metadata) and the CE/FO collectors (HasFO, AllFlags).
+    # and is read by Generate-Report.ps1. Fields come from the BAP environment list
+    # (storage, metadata), the RetrieveFinanceAndOperationsIntegrationDetails action
+    # (HasFO, FOBaseUrl), and the CE/FO collectors (AllFlags).
     # GovernanceWeight, governance flags, and Admins are added below after collection.
     $envSummaryEntry = @{
         EnvironmentId   = $envId
@@ -280,7 +325,8 @@ foreach ($env in $environments) {
         StorageLog_MB   = $env.StorageLog_MB
         StorageTotal_MB = $env.StorageTotal_MB
         HasDataverse    = $env.HasDataverse
-        HasFO           = $false   # Overwritten by CE collector if FO solutions detected
+        HasFO           = $false   # Set by RetrieveFinanceAndOperationsIntegrationDetails below
+        FOBaseUrl       = $null    # F&O AOS URL returned by the same API
         AllFlags        = @()      # Merged from: CE flags + FO flags + BAP governance flags
         OutputDir       = $envOutputDir
         Skipped         = $false
@@ -343,16 +389,36 @@ foreach ($env in $environments) {
     }
 
     try {
+        # ── F&O integration detection (authoritative Dataverse API) ──────────
+        # RetrieveFinanceAndOperationsIntegrationDetails is the mechanism Microsoft
+        # publishes for verifying Power Platform integration at runtime. It tells
+        # us both whether the Dataverse org is linked to an F&O environment and
+        # the F&O AOS URL — no need to infer from installed solutions.
+        if ($env.HasDataverse -and $env.OrgApiUrl) {
+            Write-InventoryLog '  Checking F&O integration status...' -Indent 1
+            $foDetails = Get-FOIntegrationDetails `
+                -InstanceApiUrl $env.OrgApiUrl `
+                -InstanceUrl    $env.OrgUrl
+            $envSummaryEntry.HasFO     = $foDetails.HasFO
+            $envSummaryEntry.FOBaseUrl = $foDetails.FOUrl
+            if ($foDetails.HasFO) {
+                Write-InventoryLog "  F&O integration active: $($foDetails.FOUrl)" -Level OK -Indent 1
+                Save-EnvironmentData -EnvironmentDir $envOutputDir -FileName 'fo-integration-details.json' -Data $foDetails
+            } else {
+                Write-InventoryLog '  No F&O integration.' -Level SKIP -Indent 1
+            }
+        }
+
         # ── CE Data Collection ────────────────────────────────────────────────
         if ($env.HasDataverse -and $env.OrgApiUrl) {
             $ceResult = Collect-CEEnvironmentData `
                 -EnvEntry           $env `
                 -EnvOutputDir       $envOutputDir `
+                -HasFO              $envSummaryEntry.HasFO `
                 -IncludeEntityCounts:$IncludeEntityCounts `
                 -EntityCountTop     $EntityCountTop
 
             if ($ceResult) {
-                $envSummaryEntry.HasFO    = $ceResult.HasFO
                 $envSummaryEntry.AllFlags = @($ceResult.AllFlags)
             }
         } else {
@@ -361,11 +427,12 @@ foreach ($env in $environments) {
 
         # ── FO Data Collection ────────────────────────────────────────────────
         if ($IncludeFO -and $envSummaryEntry.HasFO) {
-            Write-InventoryLog "  FO solutions detected - starting FO collection..." -Indent 1
+            Write-InventoryLog "  F&O integration detected - starting FO collection..." -Indent 1
             try {
                 $foResult = Collect-FOEnvironmentData `
                     -EnvEntry     $env `
-                    -EnvOutputDir $envOutputDir
+                    -EnvOutputDir $envOutputDir `
+                    -FOBaseUrl    $envSummaryEntry.FOBaseUrl
 
                 if ($foResult -and $foResult.AllFlags) {
                     $envSummaryEntry.AllFlags = @(
@@ -376,7 +443,7 @@ foreach ($env in $environments) {
                 Write-InventoryLog "  FO collection failed: $_" -Level WARN -Indent 1
             }
         } elseif ($IncludeFO -and -not $envSummaryEntry.HasFO) {
-            Write-InventoryLog "  No FO solutions detected - FO collection skipped." -Level SKIP -Indent 1
+            Write-InventoryLog "  No F&O integration - FO collection skipped." -Level SKIP -Indent 1
         }
 
         # ── Merge environment-level governance flags ──────────────────────

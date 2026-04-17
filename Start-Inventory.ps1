@@ -13,8 +13,8 @@
 param(
     [string]$TenantId           = '',
     [string]$EnvironmentFilter  = '',
-    [switch]$IncludeEntityCounts,
-    [switch]$IncludeFO,
+    [switch]$IncludeEntityCounts = $true,
+    [switch]$IncludeFO           = $true,
     [switch]$Force,
     [switch]$SkipPrereqCheck,
     [switch]$UseDeviceCode

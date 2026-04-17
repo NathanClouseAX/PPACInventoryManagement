@@ -14,13 +14,14 @@ All operations are **read-only**. Nothing is modified in any environment.
 cd C:\...\PPACInventoryManagement
 
 # 3. Run the convenience launcher (installs prereqs, collects data, generates report)
+#    Collects everything available by default: entity record counts + F&O data.
 .\Start-Inventory.ps1
 
-# With all options:
-.\Start-Inventory.ps1 -TenantId "your-tenant-guid" `
-                      -IncludeFO `
-                      -IncludeEntityCounts `
-                      -EnvironmentFilter "Production"
+# Fast pass: skip the slow per-entity record counts and F&O collection
+.\Start-Inventory.ps1 -IncludeEntityCounts:$false -IncludeFO:$false
+
+# Scoped to production environments on a specific tenant
+.\Start-Inventory.ps1 -TenantId "your-tenant-guid" -EnvironmentFilter "Production"
 ```
 
 ## Manual Step-by-Step
@@ -29,14 +30,14 @@ cd C:\...\PPACInventoryManagement
 # Step 1: Check / install required PowerShell modules
 .\scripts\00_Prerequisites.ps1
 
-# Step 2: Collect data (interactive browser login)
+# Step 2: Full collection (entity counts + F&O both on by default)
 .\scripts\Invoke-DataverseInventory.ps1 -OutputPath .\data
 
 # Step 2 (device code / headless / remote session):
 .\scripts\Invoke-DataverseInventory.ps1 -OutputPath .\data -UseDeviceCode
 
-# Step 2 (full collection with FO and entity record counts):
-.\scripts\Invoke-DataverseInventory.ps1 -OutputPath .\data -IncludeFO -IncludeEntityCounts
+# Step 2 (fast pass — skip entity record counts and F&O):
+.\scripts\Invoke-DataverseInventory.ps1 -OutputPath .\data -IncludeEntityCounts:$false -IncludeFO:$false
 
 # Step 3: Generate the HTML report and open it
 .\scripts\Generate-Report.ps1 -DataPath .\data -OpenReport
@@ -67,9 +68,9 @@ cd C:\...\PPACInventoryManagement
 | `-SubscriptionId` | _(current context)_ | Azure subscription ID (multi-sub tenants) |
 | `-EnvironmentFilter` | _(all)_ | Regex filter on environment display name |
 | `-SkipEnvironmentIds` | _(none)_ | Array of environment GUIDs to exclude |
-| `-IncludeEntityCounts` | `$false` | Fetch record counts per table (adds significant time) |
+| `-IncludeEntityCounts` | `$true` | Fetch record counts per table. Adds significant time on large tenants; pass `-IncludeEntityCounts:$false` to skip. |
 | `-EntityCountTop` | `150` | Max entities to count per environment |
-| `-IncludeFO` | `$false` | Collect Finance & Operations batch/user/DIXF data |
+| `-IncludeFO` | `$true` | Collect Finance & Operations batch/user/DIXF data for F&O-integrated envs. Pass `-IncludeFO:$false` to skip. |
 | `-MaxEnvironments` | `0` (unlimited) | Safety cap — stops after N environments |
 | `-Force` | `$false` | Re-collect environments that already have data |
 | `-UseDeviceCode` | `$false` | Device-code authentication flow (headless sessions) |
@@ -216,7 +217,7 @@ Each recommendation includes:
 | Old import job history | System Jobs → System Job Type = Import AND Created On < 90 days ago |
 | Self-cleaning bulk delete history | System Jobs → System Job Type = Bulk Delete AND Status = Succeeded AND Created On < 90 days ago |
 
-> **Tip**: Run with `-IncludeEntityCounts` to get additional table-level record counts that further inform cleanup decisions.
+> **Tip**: Entity record counts are collected by default. If you're on a very large tenant and want a fast pass, disable them with `-IncludeEntityCounts:$false`.
 
 ---
 
@@ -284,6 +285,7 @@ Maps environment IDs to owner information. Populated automatically from Environm
 | Cleanup Recommendations | Ranked, actionable cleanup tasks with Bulk Delete Job filters and record counts |
 | Activity / Unused | Environments with no active users or no recent audit activity |
 | Finance & Operations | FO batch job health, DualWrite map errors, DIXF failures |
+| Top Tables (Records) | Per-environment collapsible drill-down: top 25 tables by record count. Storage-concentration proxy (bytes-per-table isn't exposed by any public Dataverse/F&O API). Populated only with `-IncludeEntityCounts`. |
 | Collection Info | Run metadata, authentication details, top flags across the tenant |
 
 ---
@@ -323,8 +325,9 @@ data/
       entity-definitions.json
       entity-counts.json          # (only with -IncludeEntityCounts)
       role-assignments.json
-      dualwrite-configs.json      # (only when FO solutions detected)
-      dualwrite-entity-maps.json  # (only when FO solutions detected)
+      fo-integration-details.json # (only when F&O integration is detected)
+      dualwrite-configs.json      # (only when F&O integration is detected)
+      dualwrite-entity-maps.json  # (only when F&O integration is detected)
       fo-batch-jobs.json          # (only with -IncludeFO)
       fo-missing-cleanup-jobs.json
       fo-users.json
@@ -349,7 +352,8 @@ reports/
 
 - **Read-only**: no changes are made to any environment at any time.
 - **Resume support**: re-run without `-Force` to skip already-collected environments and continue an interrupted run. Storage values always reflect the live BAP API data, even for skipped environments.
-- **FO detection**: FO-enabled environments are identified by scanning for known FO-specific solution names in Dataverse. No FO API calls are made without `-IncludeFO`.
+- **FO detection**: F&O-integrated environments are identified authoritatively by calling the Dataverse `RetrieveFinanceAndOperationsIntegrationDetails` action, which also returns the F&O AOS URL, linked environment ID, and tenant ID. Detection runs on every environment with Dataverse; `-IncludeFO` only gates the deeper F&O AOS queries (batch jobs, DIXF, users, legal entities).
+- **Per-table storage**: Microsoft does not expose per-table byte-level storage via any public Dataverse or F&O API (the PPAC UI shows this, but the endpoint is undocumented). The report instead surfaces the **top 25 tables by record count** per environment (collected via the documented `RetrieveTotalRecordCount` function when `-IncludeEntityCounts` is used) as a storage-concentration proxy — tables with the most rows almost always dominate database storage.
 - **Token caching**: the Az module caches bearer tokens and reuses them across environments, minimizing authentication overhead on large tenants.
 - **Rate limiting**: API calls use exponential backoff with up to 5 retries on HTTP 429 / 503 responses.
 - **PS 5.1 compatibility**: the entire toolkit targets Windows PowerShell 5.1. No PS 7+ features are used.

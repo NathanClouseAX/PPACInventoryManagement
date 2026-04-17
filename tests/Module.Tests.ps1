@@ -55,45 +55,65 @@ Describe 'Get-SafeDirectoryName' {
     }
 }
 
-# ── Test-HasFOSolution ─────────────────────────────────────────────────────────
+# ── Get-FOIntegrationDetails ──────────────────────────────────────────────────
 
-Describe 'Test-HasFOSolution' {
+Describe 'Get-FOIntegrationDetails' {
 
-    It 'returns false for an empty solutions list' {
-        Test-HasFOSolution -Solutions @() | Should -BeFalse
+    Context 'environment linked to F&O' {
+        BeforeAll {
+            Mock Invoke-DataverseRequest {
+                return [PSCustomObject]@{
+                    Url                = 'https://contoso.operations.dynamics.com'
+                    TenantId           = 'aaaabbbb-0000-cccc-1111-dddd2222eeee'
+                    Id                 = 'b2106f5c-e218-4aac-841a-a59da4738eb4'
+                    IsUnifiedDatabase  = $false
+                    OrgLifecycleStatus = 'Running'
+                }
+            } -ModuleName PPACInventory
+        }
+
+        It 'reports HasFO=true and returns the F&O URL' {
+            $r = Get-FOIntegrationDetails -InstanceApiUrl 'https://x.api.crm.dynamics.com/' -InstanceUrl 'https://x.crm.dynamics.com/'
+            $r.HasFO           | Should -BeTrue
+            $r.FOUrl           | Should -Be 'https://contoso.operations.dynamics.com'
+            $r.FOEnvironmentId | Should -Be 'b2106f5c-e218-4aac-841a-a59da4738eb4'
+            $r.FOTenantId      | Should -Be 'aaaabbbb-0000-cccc-1111-dddd2222eeee'
+        }
     }
 
-    It 'returns false for non-FO solutions' {
-        $sols = @(
-            [PSCustomObject]@{ uniquename = 'CustomSolution_A' }
-            [PSCustomObject]@{ uniquename = 'SomeOtherApp'     }
-        )
-        Test-HasFOSolution -Solutions $sols | Should -BeFalse
+    Context 'environment not integrated (0x80048d0b)' {
+        BeforeAll {
+            Mock Invoke-DataverseRequest {
+                # Emulate PowerShell's Invoke-RestMethod error shape: the body lands in
+                # $_.ErrorDetails.Message, which our handler inspects.
+                $ex = [System.Net.WebException]::new('Bad Request')
+                $errRecord = [System.Management.Automation.ErrorRecord]::new(
+                    $ex, 'HttpResponseException', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null
+                )
+                $errDetails = [System.Management.Automation.ErrorDetails]::new(
+                    '{"error":{"code":"0x80048d0b","message":"Dataverse instance isn''t integrated with finance and operations."}}'
+                )
+                $errRecord.ErrorDetails = $errDetails
+                throw $errRecord
+            } -ModuleName PPACInventory
+        }
+
+        It 'reports HasFO=false without throwing' {
+            $r = Get-FOIntegrationDetails -InstanceApiUrl 'https://x.api.crm.dynamics.com/' -InstanceUrl 'https://x.crm.dynamics.com/'
+            $r.HasFO | Should -BeFalse
+            $r.FOUrl | Should -BeNullOrEmpty
+        }
     }
 
-    It 'returns true when DualWriteCore is present' {
-        $sols = @(
-            [PSCustomObject]@{ uniquename = 'DualWriteCore' }
-        )
-        Test-HasFOSolution -Solutions $sols | Should -BeTrue
-    }
+    Context 'unexpected error (e.g. 403)' {
+        BeforeAll {
+            Mock Invoke-DataverseRequest { throw 'Forbidden' } -ModuleName PPACInventory
+        }
 
-    It 'returns true when Dynamics365Finance is present' {
-        $sols = @(
-            [PSCustomObject]@{ uniquename = 'CustomSolution' }
-            [PSCustomObject]@{ uniquename = 'Dynamics365Finance' }
-        )
-        Test-HasFOSolution -Solutions $sols | Should -BeTrue
-    }
-
-    It 'returns true for partial-match FO solution names' {
-        $sols = @([PSCustomObject]@{ uniquename = 'msdyn_FinanceAndOperationsExtended_v2' })
-        Test-HasFOSolution -Solutions $sols | Should -BeTrue
-    }
-
-    It 'returns false when solution list is null' {
-        # Should not throw - null treated as empty
-        { Test-HasFOSolution -Solutions $null } | Should -Not -Throw
+        It 'returns HasFO=false and does not propagate the error' {
+            $r = Get-FOIntegrationDetails -InstanceApiUrl 'https://x.api.crm.dynamics.com/' -InstanceUrl 'https://x.crm.dynamics.com/'
+            $r.HasFO | Should -BeFalse
+        }
     }
 }
 
