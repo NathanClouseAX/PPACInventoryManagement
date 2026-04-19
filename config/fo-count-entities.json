@@ -1,0 +1,28 @@
+{
+  "_comment": "F&O Data Entities to count via the F&O OData endpoint (<foUrl>/data/<Name>?$count=true&$top=0). Used by Collect-FOData.ps1 when -IncludeEntityCounts is on. Names are the public PascalCase Data Entity names exposed by the F&O AOS — not underlying SQL table names. Entities that don't exist on a given environment return 404 and are silently skipped. Add/remove entries to tune the set for your F&O usage (custom modules, industry solutions, etc.).",
+  "Entities": [
+    { "Name": "GeneralJournalAccountEntries",    "Category": "Finance",       "Why": "posted ledger account entries - typically the largest finance table" },
+    { "Name": "GeneralJournalEntries",           "Category": "Finance",       "Why": "posted journal headers" },
+    { "Name": "LedgerJournalTransactions",       "Category": "Finance",       "Why": "unposted journal lines" },
+    { "Name": "LedgerTransactions",              "Category": "Finance",       "Why": "historical ledger transactions" },
+    { "Name": "CustomerInvoiceHeaders",          "Category": "Sales",         "Why": "posted customer invoices" },
+    { "Name": "CustomerPaymentJournalHeaders",   "Category": "Sales",         "Why": "customer payment journals" },
+    { "Name": "SalesOrderHeaders",               "Category": "Sales",         "Why": "sales order headers" },
+    { "Name": "VendorInvoiceHeaders",            "Category": "Purchase",      "Why": "posted vendor invoices" },
+    { "Name": "PurchaseOrderHeaders",            "Category": "Purchase",      "Why": "purchase order headers" },
+    { "Name": "ProductionOrderHeaders",          "Category": "Manufacturing", "Why": "production order headers" },
+    { "Name": "InventoryOnHand",                 "Category": "Inventory",     "Why": "on-hand inventory rows" },
+    { "Name": "InventoryTransactions",           "Category": "Inventory",     "Why": "inventory movements (grows with every receipt/issue)" },
+    { "Name": "BatchJobs",                       "Category": "System",        "Why": "currently-defined batch jobs" },
+    { "Name": "BatchJobHistories",               "Category": "System",        "Why": "batch execution history (should be pruned regularly)" },
+    { "Name": "BusinessEvents",                  "Category": "System",        "Why": "business event queue" },
+    { "Name": "DataManagementExecutionJobDetails","Category": "System",       "Why": "DIXF job execution details" },
+    { "Name": "SystemUsers",                     "Category": "System",        "Why": "F&O user accounts" },
+    { "Name": "WorkflowWorkItems",               "Category": "Workflow",      "Why": "workflow tasks (pending + historical)" },
+    { "Name": "Customers",                       "Category": "Master",        "Why": "customer master records" },
+    { "Name": "Vendors",                         "Category": "Master",        "Why": "vendor master records" },
+    { "Name": "ReleasedProductsV2",              "Category": "Master",        "Why": "released products catalog" },
+    { "Name": "Employees",                       "Category": "HR",            "Why": "employee master records" },
+    { "Name": "LegalEntities",                   "Category": "Master",        "Why": "F&O legal entities (companies)" }
+  ]
+}

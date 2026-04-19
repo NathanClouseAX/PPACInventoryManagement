@@ -28,7 +28,7 @@ function Collect-CEEnvironmentData {
         [string]$EnvOutputDir,        # Directory to save JSON files into
         [bool]  $HasFO = $false,      # Supplied by orchestrator from Get-FOIntegrationDetails
         [switch]$IncludeEntityCounts, # Whether to fetch record counts (slow)
-        [int]$EntityCountTop = 150    # How many entities to count (sorted by est. importance)
+        [int]$EntityCountTop = 0      # How many entities to count (0 = unlimited - count every queryable entity)
     )
 
     $displayName  = $EnvEntry.DisplayName
@@ -110,7 +110,7 @@ function Collect-CEEnvironmentData {
     }
 
     # ── 2. Bulk Delete Jobs ──────────────────────────────────────────────────
-    $bulkDelOData = "bulkdeletejobs?" +
+    $bulkDelOData = "bulkdeleteoperations?" +
         "`$select=name,statecode,statuscode,nextruntime,sendemailtocreatedby," +
         "recurrencepattern,recurrencestarttime,createdon,modifiedon&" +
         "`$orderby=createdon desc"
@@ -199,8 +199,12 @@ function Collect-CEEnvironmentData {
             ) | Where-Object { $_ }
         }
     } catch {
-        Write-InventoryLog "    -> Async count queries failed: $_" -Level WARN -Indent 3
-        $result.Sections['AsyncOperations'] = @{ Counts = @{}; Notes = @('QUERY_FAILED') }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Async count queries failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['AsyncOperations'] = @{
+            Counts = @{}
+            Notes  = @("ASYNC_OPERATIONS_$($errInfo.Category)")
+        }
     }
 
     # ── 3b. Organization Health Settings ─────────────────────────────────────
@@ -245,8 +249,9 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> Trace logging: $traceLogLabel | Audit retention: $auditRetentionLabel | Auditing on: $auditEnabled" -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Organization settings query failed: $_" -Level WARN -Indent 3
-        $result.Sections['OrgSettings'] = @{ Notes = @('QUERY_FAILED') }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Organization settings query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['OrgSettings'] = @{ Notes = @("ORG_SETTINGS_$($errInfo.Category)") }
     }
 
     # ── 4. Solutions ─────────────────────────────────────────────────────────
@@ -348,7 +353,7 @@ function Collect-CEEnvironmentData {
     }
 
     # ── 7. Duplicate Detection Rules ─────────────────────────────────────────
-    $ddOData = "duplicatedetectionrules?" +
+    $ddOData = "duplicaterules?" +
         "`$select=name,statecode,statuscode,baseentitytypecode,matchingentitytypecode,createdon,modifiedon"
     $ddRules = Invoke-DVSection -SectionName 'Duplicate Detection Rules' `
                                 -ODataPath $ddOData `
@@ -432,7 +437,8 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $(@($evValues).Count) value records; $($evVarsMissingValue.Count) definitions have no value and no default." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Environment variable values query failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Environment variable values query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     $result.Sections['EnvironmentVariables'] = @{
@@ -451,7 +457,7 @@ function Collect-CEEnvironmentData {
     try {
         $since90d  = (Get-Date).AddDays(-90).ToString('yyyy-MM-ddTHH:mm:ssZ')
         $auditResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                         -ODataPath "audits?`$select=createdon,objecttypecode,action,useragent&`$orderby=createdon desc&`$top=200" `
+                         -ODataPath "audits?`$select=createdon,objecttypecode,action&`$orderby=createdon desc&`$top=200" `
                          -TimeoutSec 90
         $auditSample = if ($auditResp.value) { $auditResp.value } else { @() }
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'audit-sample.json' -Data $auditSample
@@ -470,15 +476,23 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> Last audit entry: $lastAudit (${recentCount} in last 90d)" -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Audit query failed (auditing may be disabled): $_" -Level WARN -Indent 3
-        $result.Sections['AuditLog'] = @{ SampleCount = 0; Notes = @('QUERY_FAILED_OR_DISABLED') }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        # 404/FEATURE_NOT_ENABLED or 403 typically means auditing is off or the
+        # caller lacks the privilege — treat as a non-scored informational note.
+        $note = if ($errInfo.Category -in 'FEATURE_NOT_ENABLED','ACCESS_DENIED','NOT_FOUND') {
+            'AUDIT_DISABLED_OR_INACCESSIBLE'
+        } else {
+            "AUDIT_LOG_$($errInfo.Category)"
+        }
+        Write-InventoryLog "    -> Audit query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['AuditLog'] = @{ SampleCount = 0; Notes = @($note) }
     }
 
     # ── 12. Retention Policies ───────────────────────────────────────────────
     Write-InventoryLog '    [Retention Policies]...' -Indent 2
     try {
         $retentionResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                             -ODataPath "retentionconfigs?`$select=entitylogicalname,isreadyforretention,statecode,createdon,modifiedon" `
+                             -ODataPath "retentionconfigs?`$select=entitylogicalname,statecode,createdon,modifiedon" `
                              -TimeoutSec 60
         $retentions = if ($retentionResp.value) { $retentionResp.value } else { @() }
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'retention-policies.json' -Data $retentions
@@ -491,15 +505,25 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $($retentions.Count) retention configurations found." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Retention policies not available (feature may not be enabled): $_" -Level WARN -Indent 3
-        $result.Sections['RetentionPolicies'] = @{ TotalCount = 0; Notes = @('NOT_AVAILABLE') }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        # retentionconfigs returns 404 when the Dataverse Long-Term Retention
+        # feature isn't enabled — that's not a failure, it's a normal state.
+        $note = if ($errInfo.Category -in 'FEATURE_NOT_ENABLED','NOT_FOUND') {
+            'RETENTION_FEATURE_NOT_ENABLED'
+        } elseif ($errInfo.Category -eq 'ACCESS_DENIED') {
+            'RETENTION_ACCESS_DENIED'
+        } else {
+            "RETENTION_POLICIES_$($errInfo.Category)"
+        }
+        Write-InventoryLog "    -> Retention policies query [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['RetentionPolicies'] = @{ TotalCount = 0; Notes = @($note) }
     }
 
     # ── 12b. Mailbox / Server-Side Sync Health ──────────────────────────────
     Write-InventoryLog '    [Mailbox / Server-Side Sync Health]...' -Indent 2
     try {
         $mailboxResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                           -ODataPath "mailboxes?`$select=name,emailaddress,statuscode,mailboxstatus,outgoingemailstatus,incomingemailstatus,testmailboxaccesscompletedon,mailboxtypecode,createdon,modifiedon&`$filter=statecode eq 0&`$top=500" `
+                           -ODataPath "mailboxes?`$select=name,emailaddress,statuscode,mailboxstatus,outgoingemailstatus,incomingemailstatus,testmailboxaccesscompletedon,createdon,modifiedon&`$filter=statecode eq 0&`$top=500" `
                            -TimeoutSec 90
         $mailboxes = if ($mailboxResp.value) { $mailboxResp.value } else { @() }
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'mailboxes.json' -Data $mailboxes
@@ -528,8 +552,9 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $($mailboxes.Count) active mailboxes, $($errorMailboxes.Count) in error, $($notTestedMailboxes.Count) not tested." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Mailbox query failed: $_" -Level WARN -Indent 3
-        $result.Sections['MailboxHealth'] = @{ TotalActive = -1; Notes = @('QUERY_FAILED') }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Mailbox query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['MailboxHealth'] = @{ TotalActive = -1; Notes = @("MAILBOX_$($errInfo.Category)") }
     }
 
     # ── 12c. Unresolved Duplicate Records ───────────────────────────────────
@@ -553,8 +578,12 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $dupRecordCount unresolved duplicate records." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Duplicate records query failed: $_" -Level WARN -Indent 3
-        $result.Sections['DuplicateRecords'] = @{ UnresolvedCount = -1; Notes = @() }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Duplicate records query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['DuplicateRecords'] = @{
+            UnresolvedCount = -1
+            Notes           = @("DUPLICATE_RECORDS_$($errInfo.Category)")
+        }
     }
 
     # ── 12d. Queue Item Backlog ─────────────────────────────────────────────
@@ -576,8 +605,12 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $queueItemCount queue items." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Queue items query failed: $_" -Level WARN -Indent 3
-        $result.Sections['QueueItems'] = @{ TotalCount = -1; Notes = @() }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Queue items query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['QueueItems'] = @{
+            TotalCount = -1
+            Notes      = @("QUEUE_ITEMS_$($errInfo.Category)")
+        }
     }
 
     # ── 12e. Service Endpoint / Webhook Health ──────────────────────────────
@@ -603,8 +636,12 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $($endpoints.Count) service endpoints ($($webhooks.Count) webhooks, $($eventHubs.Count) event hubs, $($serviceBus.Count) service bus)." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Service endpoint query failed: $_" -Level WARN -Indent 3
-        $result.Sections['ServiceEndpoints'] = @{ TotalCount = -1; Notes = @() }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Service endpoint query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['ServiceEndpoints'] = @{
+            TotalCount = -1
+            Notes      = @("SERVICE_ENDPOINTS_$($errInfo.Category)")
+        }
     }
 
     # ── 12f. SLA KPI Violations ─────────────────────────────────────────────
@@ -627,8 +664,14 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $slaViolationCount noncompliant SLA KPI instances." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> SLA KPI query failed (SLAs may not be configured): $_" -Level WARN -Indent 3
-        $result.Sections['SLAViolations'] = @{ NoncompliantCount = -1; Notes = @() }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> SLA KPI query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $note = if ($errInfo.Category -in 'FEATURE_NOT_ENABLED','NOT_FOUND') {
+            'SLA_NOT_CONFIGURED'
+        } else {
+            "SLA_$($errInfo.Category)"
+        }
+        $result.Sections['SLAViolations'] = @{ NoncompliantCount = -1; Notes = @($note) }
     }
 
     # ── 12g. Stale Process Instances ────────────────────────────────────────
@@ -638,7 +681,7 @@ function Collect-CEEnvironmentData {
     try {
         $since180 = (Get-Date).AddDays(-180).ToString('yyyy-MM-ddTHH:mm:ssZ')
         $staleProcResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                             -ODataPath "processsessions?`$filter=statecode eq 1 and createdon le $since180&`$count=true&`$top=1&`$select=activityid" `
+                             -ODataPath "processsessions?`$filter=statecode eq 1 and createdon le $since180&`$count=true&`$top=1&`$select=processsessionid" `
                              -TimeoutSec 60
         $staleProcCount = if ($staleProcResp.'@odata.count' -ne $null) { [int]$staleProcResp.'@odata.count' } else { -1 }
 
@@ -653,8 +696,12 @@ function Collect-CEEnvironmentData {
         }
         Write-InventoryLog "    -> $staleProcCount active process sessions older than 180 days." -Level OK -Indent 3
     } catch {
-        Write-InventoryLog "    -> Stale process session query failed: $_" -Level WARN -Indent 3
-        $result.Sections['StaleProcessInstances'] = @{ StaleActiveCount = -1; Notes = @() }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Stale process session query failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['StaleProcessInstances'] = @{
+            StaleActiveCount = -1
+            Notes            = @("PROCESS_SESSIONS_$($errInfo.Category)")
+        }
     }
 
     # ── 13. Process Sessions (flow run volume indicator) ─────────────────────
@@ -662,14 +709,18 @@ function Collect-CEEnvironmentData {
     try {
         $since30 = (Get-Date).AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
         $psResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                      -ODataPath "processsessions?`$filter=createdon ge $since30&`$count=true&`$top=1&`$select=activityid" `
+                      -ODataPath "processsessions?`$filter=createdon ge $since30&`$count=true&`$top=1&`$select=processsessionid" `
                       -TimeoutSec 60
         $psCount = if ($psResp.'@odata.count' -ne $null) { [int]$psResp.'@odata.count' } else { -1 }
         $result.Sections['ProcessSessions'] = @{ Last30dCount = $psCount }
         Write-InventoryLog "    -> ~$psCount process sessions in last 30 days." -Level OK -Indent 3
     } catch {
-        $result.Sections['ProcessSessions'] = @{ Last30dCount = -1 }
-        Write-InventoryLog "    -> Could not count process sessions: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Could not count process sessions [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['ProcessSessions'] = @{
+            Last30dCount = -1
+            Notes        = @("PROCESS_SESSIONS_VOLUME_$($errInfo.Category)")
+        }
     }
 
     # ── 13b. Cleanup Table Health Indicators ─────────────────────────────────
@@ -684,14 +735,15 @@ function Collect-CEEnvironmentData {
     try {
         $since30wf = (Get-Date).AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
         $wfLogR    = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                         -ODataPath "workflowlogs?`$filter=status eq 2 and createdon le $since30wf&`$count=true&`$top=1&`$select=activityid" `
+                         -ODataPath "workflowlogs?`$filter=status eq 2 and createdon le $since30wf&`$count=true&`$top=1&`$select=workflowlogid" `
                          -TimeoutSec 60
         $wfLogOldCount = if ($wfLogR.'@odata.count' -ne $null) { [int]$wfLogR.'@odata.count' } else { -1 }
         if ($wfLogOldCount -gt 50000) {
             $cleanupHealthNotes.Add("OLD_WORKFLOW_LOGS_ACCUMULATING ($wfLogOldCount succeeded WorkflowLog records >30d - async operation cleanup may not be running)")
         }
     } catch {
-        Write-InventoryLog "    -> WorkflowLog count failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> WorkflowLog count failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     # PluginTraceLog (PluginTraceLogBase): any records indicate trace logging was/is active.
@@ -700,14 +752,15 @@ function Collect-CEEnvironmentData {
     $pluginTraceLogCount = -1
     try {
         $ptlR = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                    -ODataPath "plugintracelogs?`$count=true&`$top=1&`$select=plugintraceid" `
+                    -ODataPath "plugintracelogs?`$count=true&`$top=1&`$select=plugintracelogid" `
                     -TimeoutSec 60
         $pluginTraceLogCount = if ($ptlR.'@odata.count' -ne $null) { [int]$ptlR.'@odata.count' } else { -1 }
         if ($pluginTraceLogCount -gt 5000) {
             $cleanupHealthNotes.Add("PLUGIN_TRACE_LOGS_ACCUMULATING ($pluginTraceLogCount records - verify recurring cleanup job is active and trace logging is disabled in production)")
         }
     } catch {
-        Write-InventoryLog "    -> PluginTraceLog count failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> PluginTraceLog count failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     # Annotation (AnnotationBase / Notes): records with large file attachments are top
@@ -715,14 +768,15 @@ function Collect-CEEnvironmentData {
     $largeAnnotationCount = -1
     try {
         $annotR = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                      -ODataPath "annotations?`$filter=filesizeinbytes gt 1048576&`$count=true&`$top=1&`$select=annotationid" `
+                      -ODataPath "annotations?`$filter=filesize gt 1048576&`$count=true&`$top=1&`$select=annotationid" `
                       -TimeoutSec 60
         $largeAnnotationCount = if ($annotR.'@odata.count' -ne $null) { [int]$annotR.'@odata.count' } else { -1 }
         if ($largeAnnotationCount -gt 500) {
             $cleanupHealthNotes.Add("LARGE_ANNOTATION_FILES ($largeAnnotationCount notes with >1 MB attachments - significant file storage consumer; consider bulk delete job for old attachments)")
         }
     } catch {
-        Write-InventoryLog "    -> Annotation large-file count failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Annotation large-file count failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     # Email activities (EmailBase): completed emails older than 90 days consume significant
@@ -739,7 +793,8 @@ function Collect-CEEnvironmentData {
             $cleanupHealthNotes.Add("OLD_COMPLETED_EMAILS ($oldEmailCount completed email activities >90d - consider a recurring bulk delete job: statecode=1 AND actualend <90d ago)")
         }
     } catch {
-        Write-InventoryLog "    -> Email activity count failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Email activity count failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     # ImportJob (ImportJobBase): completed import history records older than 90 days.
@@ -755,7 +810,8 @@ function Collect-CEEnvironmentData {
             $cleanupHealthNotes.Add("OLD_IMPORT_JOB_HISTORY ($oldImportCount import job records >90d - no cleanup bulk deletion job found; create one: System Job Type = Import AND Completed On older than 90 days)")
         }
     } catch {
-        Write-InventoryLog "    -> ImportJob count failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> ImportJob count failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     # BulkDeleteOperation (BulkDeleteOperationBase): history of past bulk delete runs.
@@ -764,14 +820,15 @@ function Collect-CEEnvironmentData {
     try {
         $since90bd  = (Get-Date).AddDays(-90).ToString('yyyy-MM-ddTHH:mm:ssZ')
         $bulkDelOpR = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                          -ODataPath "bulkdeleteoperations?`$filter=statecode eq 3 and completedon le $since90bd&`$count=true&`$top=1&`$select=bulkdeleteoperationid" `
+                          -ODataPath "bulkdeleteoperations?`$filter=statecode eq 3 and modifiedon le $since90bd&`$count=true&`$top=1&`$select=bulkdeleteoperationid" `
                           -TimeoutSec 60
         $oldBulkDeleteOpCount = if ($bulkDelOpR.'@odata.count' -ne $null) { [int]$bulkDelOpR.'@odata.count' } else { -1 }
         if ($oldBulkDeleteOpCount -gt 100) {
             $cleanupHealthNotes.Add("OLD_BULK_DELETE_OPERATION_HISTORY ($oldBulkDeleteOpCount completed bulk delete operation records >90d - create a self-cleaning bulk delete job: System Job Type = Bulk Delete AND Completed On older than 90 days)")
         }
     } catch {
-        Write-InventoryLog "    -> BulkDeleteOperation count failed: $_" -Level WARN -Indent 3
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> BulkDeleteOperation count failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
     }
 
     $result.Sections['CleanupTableHealth'] = @{
@@ -787,24 +844,31 @@ function Collect-CEEnvironmentData {
     Write-InventoryLog "    -> WFLog(>30d): $wfLogOldCount | TraceLog: $pluginTraceLogCount | LargeAnnotations(>1MB): $largeAnnotationCount | OldEmails(>90d): $oldEmailCount | OldImports(>90d): $oldImportCount | OldBulkDelOps(>90d): $oldBulkDeleteOpCount" -Level OK -Indent 3
 
     # ── 14. Entity / Table Statistics ────────────────────────────────────────
+    # Dataverse metadata endpoint rejects BOTH $orderby and $select with 0x80060888
+    # "query parameter is not supported" on some tenants (the server redacts which
+    # parameter, so we can't discriminate). Fetch the full EntityDefinitions payload
+    # and project the handful of fields we actually need client-side. The endpoint
+    # is paginated, so response size scales with @odata.nextLink follow-through.
     Write-InventoryLog '    [Entity Definitions]...' -Indent 2
     try {
         $entityResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                          -ODataPath "EntityDefinitions?`$select=LogicalName,DisplayName,EntitySetName,IsCustomEntity,IsActivity,DataProviderId,OwnershipType,IsValidForAdvancedFind&`$orderby=LogicalName asc" `
-                          -TimeoutSec 180
-        $entities = Get-AllODataPages -InitialResponse $entityResp -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl -MaxPages 20
+                          -ODataPath 'EntityDefinitions' `
+                          -TimeoutSec 300
+        $entities = Get-AllODataPages -InitialResponse $entityResp -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl -MaxPages 40
 
-        # Strip down to essential fields for storage
-        $entitySummary = $entities | ForEach-Object {
+        # Strip down to essential fields for storage, then sort client-side
+        $entitySummary = @($entities | ForEach-Object {
             @{
                 LogicalName       = $_.LogicalName
-                DisplayName       = $_.DisplayName.UserLocalizedLabel.Label
+                DisplayName       = if ($_.DisplayName -and $_.DisplayName.UserLocalizedLabel) {
+                                        $_.DisplayName.UserLocalizedLabel.Label
+                                    } else { $_.LogicalName }
                 EntitySetName     = $_.EntitySetName
                 IsCustomEntity    = $_.IsCustomEntity
                 IsActivity        = $_.IsActivity
                 OwnershipType     = $_.OwnershipType
             }
-        }
+        } | Sort-Object LogicalName)
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'entity-definitions.json' -Data $entitySummary
         Write-InventoryLog "    -> $($entitySummary.Count) entity definitions saved." -Level OK -Indent 3
 
@@ -815,9 +879,8 @@ function Collect-CEEnvironmentData {
 
         # ── 14b. Entity Record Counts ─────────────────────────────────────────
         if ($IncludeEntityCounts) {
-            Write-InventoryLog "    [Entity Record Counts - top $EntityCountTop entities]..." -Indent 2
-
-            # Prioritize: custom entities + known high-volume OOB entities
+            # Known high-volume OOB entities — counted first so progress shows the
+            # important tables early even on envs with thousands of entities.
             $priorityOOB = @(
                 # Core activity / communication tables (top database storage consumers)
                 'activitypointer','email','appointment','task','phonecall','activityparty',
@@ -839,28 +902,67 @@ function Collect-CEEnvironmentData {
                 'exchangesyncidmapping'
             )
 
+            # Build ordered list: custom → priority OOB → everything else queryable.
+            # Exclude mserp_* — those are F&O virtual tables surfaced into Dataverse;
+            # counting them via the CE endpoint hits the federation layer (slow,
+            # fragile, returns invalid PK names). Collect-FOData queries F&O's native
+            # OData directly for this set instead.
+            $seen = @{}
             $toCount = [System.Collections.Generic.List[object]]::new()
-            # Custom entities first
-            $toCount.AddRange([object[]]@($entitySummary | Where-Object { $_.IsCustomEntity -and $_.EntitySetName }))
-            # Then priority OOB
+
+            foreach ($ent in @($entitySummary | Where-Object {
+                $_.IsCustomEntity -and $_.EntitySetName -and ($_.LogicalName -notlike 'mserp_*')
+            })) {
+                $toCount.Add($ent)
+                $seen[$ent.LogicalName] = $true
+            }
             foreach ($oob in $priorityOOB) {
-                $match = $entitySummary | Where-Object { $_.LogicalName -eq $oob }
-                if ($match -and ($toCount | Where-Object { $_.LogicalName -eq $oob }).Count -eq 0) {
+                $match = $entitySummary | Where-Object { $_.LogicalName -eq $oob -and $_.EntitySetName } | Select-Object -First 1
+                if ($match -and -not $seen.ContainsKey($match.LogicalName)) {
                     $toCount.Add($match)
+                    $seen[$match.LogicalName] = $true
+                }
+            }
+            foreach ($ent in @($entitySummary | Where-Object {
+                $_.EntitySetName -and ($_.LogicalName -notlike 'mserp_*')
+            })) {
+                if (-not $seen.ContainsKey($ent.LogicalName)) {
+                    $toCount.Add($ent)
+                    $seen[$ent.LogicalName] = $true
                 }
             }
 
+            # EntityCountTop = 0 means unlimited (count every queryable entity).
+            $cap = if ($EntityCountTop -gt 0) { [Math]::Min($EntityCountTop, $toCount.Count) } else { $toCount.Count }
+            $capLabel = if ($EntityCountTop -gt 0) { "top $cap" } else { "all $cap" }
+            Write-InventoryLog "    [Entity Record Counts - $capLabel entities]..." -Indent 2
+
             $countResults = [System.Collections.Generic.List[hashtable]]::new()
-            $counted = 0
+            $traceList    = [System.Collections.Generic.List[object]]::new()
+            $attempted = 0
             foreach ($ent in $toCount) {
-                if ($counted -ge $EntityCountTop -or -not $ent.EntitySetName) { break }
+                if ($attempted -ge $cap -or -not $ent.EntitySetName) { break }
                 Write-Progress -Activity 'Counting entity records' `
-                               -Status "$($ent.LogicalName) ($counted/$EntityCountTop)" `
-                               -PercentComplete (($counted / $EntityCountTop) * 100)
-                $cnt = Get-DataverseEntityCount -InstanceApiUrl $apiUrl `
+                               -Status "$($ent.LogicalName) ($attempted/$cap)" `
+                               -PercentComplete (($attempted / $cap) * 100)
+                $res = Get-DataverseEntityCount -InstanceApiUrl $apiUrl `
                                                 -EntitySetName  $ent.EntitySetName `
                                                 -InstanceUrl    $instanceUrl `
                                                 -TimeoutSec     30
+                $cnt = [int64]$res.Count
+                $traceList.Add([PSCustomObject]@{
+                    EntityName  = $ent.LogicalName
+                    EntitySet   = $ent.EntitySetName
+                    IsCustom    = [bool]$ent.IsCustomEntity
+                    Method      = 'GET'
+                    Uri         = $res.Uri
+                    HttpStatus  = $res.HttpStatus
+                    Outcome     = if ($cnt -ge 0) { 'Success' } else { 'Error' }
+                    RecordCount = if ($cnt -ge 0) { $cnt } else { $null }
+                    ElapsedMs   = $res.ElapsedMs
+                    Error       = $res.Error
+                    Timestamp   = (Get-Date).ToUniversalTime().ToString('o')
+                })
                 if ($cnt -ge 0) {
                     $countResults.Add(@{
                         LogicalName   = $ent.LogicalName
@@ -869,12 +971,18 @@ function Collect-CEEnvironmentData {
                         RecordCount   = $cnt
                     })
                 }
-                $counted++
+                $attempted++
             }
             Write-Progress -Activity 'Counting entity records' -Completed
 
             $sorted = @($countResults | Sort-Object RecordCount -Descending)
             Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'entity-counts.json' -Data $sorted
+            # Per-request trace: every endpoint hit, outcome, HTTP status, timing, and error text.
+            Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'entity-counts.trace.json' -Data @($traceList)
+            $ceTraceErrors = @($traceList | Where-Object { $_.Outcome -eq 'Error' }).Count
+            if ($ceTraceErrors -gt 0) {
+                Write-InventoryLog "    -> $ceTraceErrors CE entity count error(s) - see entity-counts.trace.json" -Level WARN -Indent 3
+            }
 
             $largeCustom = @($sorted | Where-Object { $_.IsCustom -and $_.RecordCount -gt 100000 })
             # Teams-linked tables (Dataverse for Teams) have strict 2 GB storage limits
@@ -892,8 +1000,14 @@ function Collect-CEEnvironmentData {
             Write-InventoryLog "    -> Record counts collected for $($sorted.Count) entities." -Level OK -Indent 3
         }
     } catch {
-        Write-InventoryLog "    -> Entity definition fetch failed: $_" -Level WARN -Indent 3
-        $result.Sections['Entities'] = @{ TotalCount = -1; Error = $_.ToString() }
+        $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+        Write-InventoryLog "    -> Entity definition fetch failed [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+        $result.Sections['Entities'] = @{
+            TotalCount    = -1
+            Notes         = @("ENTITY_METADATA_$($errInfo.Category)")
+            FailureStatus = $errInfo.Status
+            FailureDetail = $errInfo.Message
+        }
     }
 
     # ── 15. Dual-Write Configuration (FO link indicator) ─────────────────────
@@ -901,7 +1015,7 @@ function Collect-CEEnvironmentData {
         Write-InventoryLog '    [Dual-Write Configuration]...' -Indent 2
         try {
             $dwResp = Invoke-DataverseRequest -InstanceApiUrl $apiUrl -InstanceUrl $instanceUrl `
-                          -ODataPath "msdyn_dualwriteruntimeconfigs?`$select=msdyn_dualwriteruntimeconfigid,msdyn_name,msdyn_status,createdon,modifiedon" `
+                          -ODataPath "msdyn_dualwriteruntimeconfigs?`$select=msdyn_dualwriteruntimeconfigid,msdyn_name,statecode,statuscode,createdon,modifiedon" `
                           -TimeoutSec 60
             $dwConfigs = if ($dwResp.value) { $dwResp.value } else { @() }
             Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'dualwrite-configs.json' -Data $dwConfigs
@@ -923,8 +1037,14 @@ function Collect-CEEnvironmentData {
             }
             Write-InventoryLog "    -> $($dwMaps.Count) dual-write maps, $($errMaps.Count) in error state." -Level OK -Indent 3
         } catch {
-            Write-InventoryLog "    -> Dual-write query failed (may not be configured): $_" -Level WARN -Indent 3
-            $result.Sections['DualWrite'] = @{ Notes = @('NOT_CONFIGURED_OR_INACCESSIBLE') }
+            $errInfo = Get-HttpErrorClassification -ErrorRecord $_
+            Write-InventoryLog "    -> Dual-write query [$($errInfo.Category) status=$($errInfo.Status)]: $($errInfo.Message)" -Level WARN -Indent 3
+            $note = if ($errInfo.Category -in 'FEATURE_NOT_ENABLED','NOT_FOUND') {
+                'DUALWRITE_NOT_CONFIGURED'
+            } else {
+                "DUALWRITE_$($errInfo.Category)"
+            }
+            $result.Sections['DualWrite'] = @{ Notes = @($note) }
         }
     }
 

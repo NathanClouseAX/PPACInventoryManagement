@@ -24,7 +24,7 @@ function Get-AllEnvironments {
     Write-InventoryLog 'Fetching tenant capacity summary...' -Indent 1
     $capacitySummary = $null
     $capacityPaths = @(
-        '/providers/Microsoft.BusinessAppPlatform/scopes/admin/capacity?api-version=2022-03-01-preview',
+        '/providers/Microsoft.BusinessAppPlatform/scopes/admin/capacity?api-version=2024-05-01',
         '/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2021-04-01&$expand=properties.capacity&$top=1'
     )
     foreach ($cp in $capacityPaths) {

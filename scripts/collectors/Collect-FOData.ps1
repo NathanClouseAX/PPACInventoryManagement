@@ -27,7 +27,8 @@ function Collect-FOEnvironmentData {
         [hashtable]$EnvEntry,       # From Get-AllEnvironments
         [string]$EnvOutputDir,      # Directory to save JSON files into
         [Parameter(Mandatory)]
-        [string]$FOBaseUrl          # F&O AOS URL from Get-FOIntegrationDetails
+        [string]$FOBaseUrl,         # F&O AOS URL from Get-FOIntegrationDetails
+        [switch]$IncludeEntityCounts  # When set, count records for entities in config/fo-count-entities.json
     )
 
     $displayName = $EnvEntry.DisplayName
@@ -107,27 +108,35 @@ function Collect-FOEnvironmentData {
     }
 
     # ── 1. FO System Parameters ───────────────────────────────────────────────
+    # Schema confirmed from $metadata: SystemParameters exposes a small field set
+    # (ID, SystemCurrencyCode, SystemLanguage, ExchangeRate, etc.). No $select to
+    # let the server return whatever it supports; we keep the raw payload for audit.
     $sysParams = Invoke-FOOData `
-        -Path 'SystemParameters?$select=SystemParameters_AccountsPayablePurchaseOrderThreshold,DataAreaId,PurchaseOrderVersion' `
+        -Path 'SystemParameters' `
         -SectionLabel 'System Parameters' `
         -SaveFileName 'fo-system-parameters.json'
 
     # ── 2. Batch Jobs ─────────────────────────────────────────────────────────
+    # Field names confirmed against $metadata EntityType="BatchJob":
+    #   Key = BatchJobRecId (not BatchJobId)
+    #   Description lives on JobDescription (not Description)
+    #   BatchStatus enum returns as string names: Hold, Waiting, Executing, Error,
+    #     Finished, Ready, NotRun, Cancelling, Canceled, Scheduled
     $batchJobs = Invoke-FOOData `
-        -Path 'BatchJobs?$select=BatchJobId,Description,Status,StartDateTime,EndDateTime,WithholdedUntil,Recurrence,CaptureName,LastExecutedDateTime,LastExecutionEndTime,LastExecutionStartTime,AlertsForErrors,AlertsForEnded,AlertsForExecuted' `
+        -Path 'BatchJobs?$select=BatchJobRecId,JobDescription,Status,OrigStartDateTime,StartDateTime,EndDateTime,Recurrence,CanceledBy,ExecutingBy,CompanyAccounts' `
         -SectionLabel 'Batch Jobs' `
         -SaveFileName 'fo-batch-jobs.json' `
         -Paginate
 
     if ($batchJobs) {
         $bjArr = @($batchJobs)
-        # Status values: Waiting=0, Executing=1, Ready=2, Withheld=3, Error=4, Cancelling=5, Canceled=6
         $batchByStatus = $bjArr | Group-Object Status | ForEach-Object {
             [PSCustomObject]@{ Status = $_.Name; Count = $_.Count }
         }
-        $errorJobs    = @($bjArr | Where-Object { $_.Status -eq 4 })
-        $waitingJobs  = @($bjArr | Where-Object { $_.Status -eq 0 })
-        $withHeldJobs = @($bjArr | Where-Object { $_.Status -eq 3 })
+        # Status comes back as string enum name; compare against the names.
+        $errorJobs    = @($bjArr | Where-Object { $_.Status -eq 'Error' })
+        $waitingJobs  = @($bjArr | Where-Object { $_.Status -eq 'Waiting' })
+        $withHeldJobs = @($bjArr | Where-Object { $_.Status -eq 'Hold' })
         $noRecurrence = @($bjArr | Where-Object { -not $_.Recurrence })
 
         $result.Sections['BatchJobs'] = @{
@@ -137,7 +146,7 @@ function Collect-FOEnvironmentData {
             WaitingCount    = $waitingJobs.Count
             WithheldCount   = $withHeldJobs.Count
             NoRecurrenceCount = $noRecurrence.Count
-            ErrorJobs       = @($errorJobs | Select-Object -First 20 -Property BatchJobId, Description, LastExecutedDateTime)
+            ErrorJobs       = @($errorJobs | Select-Object -First 20 -Property BatchJobRecId, JobDescription, EndDateTime)
             Notes           = @(
                 if ($errorJobs.Count -gt 0)   { "FO_BATCH_JOBS_IN_ERROR ($($errorJobs.Count))" }
                 if ($withHeldJobs.Count -gt 5) { "FO_MANY_WITHHELD_JOBS ($($withHeldJobs.Count))" }
@@ -149,14 +158,18 @@ function Collect-FOEnvironmentData {
     }
 
     # ── 3. Batch Job Groups ───────────────────────────────────────────────────
+    # $metadata confirmed: BatchGroup exposes GroupId, Description, ServerId only.
     Invoke-FOOData `
-        -Path 'BatchGroups?$select=GroupId,Description,IsThrottled' `
+        -Path 'BatchGroups?$select=GroupId,Description,ServerId' `
         -SectionLabel 'Batch Groups' `
         -SaveFileName 'fo-batch-groups.json' | Out-Null
 
-    # ── 4. Data Management (DIXF) Job History ─────────────────────────────────
+    # ── 4. Data Management (DIXF) Definition Groups ───────────────────────────
+    # $metadata: DataManagementDefinitionGroup exposes Name (PK), Description,
+    # OperationType, ProjectCategory, GenerateDataPackage, TruncateEntityData.
+    # There is no IsEnabled / CreatedDateTime on this entity.
     $dixfJobs = Invoke-FOOData `
-        -Path "DataManagementDefinitionGroups?`$select=DefinitionGroupName,Description,IsEnabled,CreatedDateTime,ModifiedDateTime&`$top=500" `
+        -Path "DataManagementDefinitionGroups?`$select=Name,Description,OperationType,ProjectCategory,GenerateDataPackage&`$top=500" `
         -SectionLabel 'DIXF Definition Groups' `
         -SaveFileName 'fo-dixf-definition-groups.json'
 
@@ -164,15 +177,22 @@ function Collect-FOEnvironmentData {
         DefinitionGroupCount = if ($dixfJobs) { @($dixfJobs).Count } else { 0 }
     }
 
-    # ── 5. DIXF Execution History (recent) ───────────────────────────────────
+    # ── 5. DIXF Execution Job Details (recent) ───────────────────────────────
+    # $metadata: DataManagementExecutionJobDetails is the richer entity. Status
+    # fields (StagingStatus, TargetStatus) use DMFExecutionSummaryStatus enum:
+    # Unknown, NotRun, Executing, Succeeded, PartiallySucceeded, Failed, Canceled.
+    # No CreatedDateTime — use StagingStartDateTime for ordering.
     $dixfExec = Invoke-FOOData `
-        -Path "DataManagementExecutionHistories?`$select=ExecutionId,DefinitionGroupName,Status,StartTime,EndTime,CreatedDateTime&`$orderby=CreatedDateTime desc&`$top=100" `
-        -SectionLabel 'DIXF Execution History (last 100)' `
+        -Path "DataManagementExecutionJobDetails?`$select=JobId,EntityName,StagingStatus,TargetStatus,StagingStartDateTime,StagingEndDateTime,TargetStartDateTime,TargetEndDateTime,StagingRecordsCreatedCount,TargetRecordsCreatedCount&`$orderby=StagingStartDateTime desc&`$top=200" `
+        -SectionLabel 'DIXF Execution Job Details (last 200)' `
         -SaveFileName 'fo-dixf-execution-history.json'
 
     if ($dixfExec) {
         $dixfArr = @($dixfExec)
-        $failedDixf = @($dixfArr | Where-Object { $_.Status -in 'Error', 'Aborted' })
+        $failedDixf = @($dixfArr | Where-Object {
+            $_.StagingStatus -eq 'Failed' -or $_.TargetStatus -eq 'Failed' -or
+            $_.StagingStatus -eq 'PartiallySucceeded' -or $_.TargetStatus -eq 'PartiallySucceeded'
+        })
         $result.Sections['DIXFExecution'] = @{
             RecentCount  = $dixfArr.Count
             FailedCount  = $failedDixf.Count
@@ -542,10 +562,26 @@ function Collect-FOEnvironmentData {
                             $knownCleanupJobsFinance +
                             $knownCleanupJobsRetail
 
-        $missingCleanup = [System.Collections.Generic.List[hashtable]]::new()
+        # BatchStatus enum (confirmed from $metadata):
+        #   0 Hold · 1 Waiting · 2 Executing · 3 Error · 4 Finished · 5 Ready
+        #   6 NotRun · 7 Cancelling · 8 Canceled · 9 Scheduled
+        # OData returns the string name, not the integer. A job is "enabled" (will
+        # fire) when Status is Waiting / Executing / Ready / Scheduled.
+        # Hold = user paused · Canceled/NotRun = terminal · Error = broken.
+        $enabledLabels = @('Waiting','Executing','Ready','Scheduled')
+        $errorLabel    = 'Error'
+
+        # BatchJob exposes the user-entered description as JobDescription (not Description).
+        $descriptionField = 'JobDescription'
+
+        $missingCleanup      = [System.Collections.Generic.List[hashtable]]::new()
+        $foundCleanup        = [System.Collections.Generic.List[hashtable]]::new()
+        $foundButAllDisabled = 0
+        $foundInErrorOnly    = 0
+
         foreach ($cj in $knownCleanupJobs) {
-            $found = $bjArr | Where-Object { $_.Description -like $cj.Pattern }
-            if (-not $found) {
+            $jobMatches = @($bjArr | Where-Object { $_.$descriptionField -like $cj.Pattern })
+            if ($jobMatches.Count -eq 0) {
                 $missingCleanup.Add(@{
                     Pattern    = $cj.Pattern
                     Purpose    = $cj.Purpose
@@ -554,7 +590,51 @@ function Collect-FOEnvironmentData {
                     BatchClass = $cj.BatchClass
                     Notes      = $cj.Notes
                 })
+                continue
             }
+
+            $matchedJobs   = [System.Collections.Generic.List[object]]::new()
+            $enabledCount  = 0
+            $errorCount    = 0
+            $disabledCount = 0
+
+            foreach ($m in $jobMatches) {
+                $statusLabel = [string]$m.Status
+                $isEnabled   = $enabledLabels -contains $statusLabel
+                $isError     = $statusLabel -eq $errorLabel
+
+                if ($isEnabled)    { $enabledCount++ }
+                elseif ($isError)  { $errorCount++ }
+                else               { $disabledCount++ }
+
+                $matchedJobs.Add([ordered]@{
+                    BatchJobRecId  = $m.BatchJobRecId
+                    JobDescription = $m.JobDescription
+                    Status         = $statusLabel
+                    IsEnabled      = $isEnabled
+                    HasRecurrence  = [bool]$m.Recurrence
+                    StartDateTime  = $m.StartDateTime
+                    EndDateTime    = $m.EndDateTime
+                    CompanyAccounts = $m.CompanyAccounts
+                })
+            }
+
+            if ($enabledCount -eq 0 -and $errorCount -eq 0) { $foundButAllDisabled++ }
+            elseif ($enabledCount -eq 0 -and $errorCount -gt 0) { $foundInErrorOnly++ }
+
+            $foundCleanup.Add(@{
+                Pattern       = $cj.Pattern
+                Purpose       = $cj.Purpose
+                Category      = $cj.Category
+                MenuPath      = $cj.MenuPath
+                BatchClass    = $cj.BatchClass
+                MatchCount    = $jobMatches.Count
+                EnabledCount  = $enabledCount
+                ErrorCount    = $errorCount
+                DisabledCount = $disabledCount
+                IsEnabled     = ($enabledCount -gt 0)
+                MatchedJobs   = @($matchedJobs)
+            })
         }
 
         # Group missing jobs by category for easier reporting
@@ -563,72 +643,257 @@ function Collect-FOEnvironmentData {
         } | Sort-Object Category
 
         $result.Sections['FOCleanupJobs'] = @{
-            TotalChecked        = $knownCleanupJobs.Count
-            MissingCount        = $missingCleanup.Count
-            MissingStandardJobs = @($missingCleanup)
-            MissingByCategory   = @($missingByCategory)
-            Notes               = @(
+            TotalChecked          = $knownCleanupJobs.Count
+            MissingCount          = $missingCleanup.Count
+            FoundCount            = $foundCleanup.Count
+            FoundButAllDisabled   = $foundButAllDisabled
+            FoundInErrorOnly      = $foundInErrorOnly
+            MissingStandardJobs   = @($missingCleanup)
+            MissingByCategory     = @($missingByCategory)
+            FoundStandardJobs     = @($foundCleanup)
+            Notes                 = @(
                 if ($missingCleanup.Count -gt 0) {
                     "FO_MISSING_CLEANUP_JOBS ($($missingCleanup.Count) of $($knownCleanupJobs.Count) standard jobs not found)"
+                }
+                if ($foundButAllDisabled -gt 0) {
+                    "FO_CLEANUP_JOBS_NOT_ENABLED ($foundButAllDisabled of $($foundCleanup.Count) found cleanup jobs are Withheld/Canceled with no active schedule)"
+                }
+                if ($foundInErrorOnly -gt 0) {
+                    "FO_CLEANUP_JOBS_IN_ERROR ($foundInErrorOnly of $($foundCleanup.Count) found cleanup jobs are in Error state with no healthy replacement)"
                 }
             ) | Where-Object { $_ }
         }
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-missing-cleanup-jobs.json' -Data $missingCleanup
-        Write-InventoryLog "    -> $($missingCleanup.Count) of $($knownCleanupJobs.Count) standard cleanup jobs not found." -Level OK -Indent 3
+        Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-cleanup-jobs-found.json'   -Data @($foundCleanup)
+        Write-InventoryLog "    -> $($foundCleanup.Count) found ($foundButAllDisabled disabled, $foundInErrorOnly in error); $($missingCleanup.Count) missing." -Level OK -Indent 3
     }
 
     # ── 7. FO Legal Entities ──────────────────────────────────────────────────
+    # $metadata: LegalEntity key is LegalEntityId. No Enabled/IsPrimary/IsVirtual
+    # field is exposed via OData — those only exist on the backing table.
     $legalEntities = Invoke-FOOData `
-        -Path 'LegalEntities?$select=DataAreaId,Name,Country,Enabled,IsPrimary,IsVirtual' `
+        -Path 'LegalEntities?$select=LegalEntityId,Name,CompanyCountry' `
         -SectionLabel 'Legal Entities' `
         -SaveFileName 'fo-legal-entities.json'
 
     $result.Sections['LegalEntities'] = @{
         TotalCount  = if ($legalEntities) { @($legalEntities).Count } else { 0 }
-        EnabledCount = if ($legalEntities) { @($legalEntities | Where-Object { $_.Enabled -eq 'Yes' }).Count } else { 0 }
     }
 
-    # ── 8. FO Users ───────────────────────────────────────────────────────────
+    # ── 8. FO System Users ────────────────────────────────────────────────────
+    # Entity set is SystemUsers (not Users). $metadata exposes UserID, Alias,
+    # Enabled, Email, NetworkDomain, UserName, Language. LastLoginDateTime is NOT
+    # exposed via OData — FO tracks it internally (SysUserLog) but doesn't surface
+    # it here, so the 90-day-activity heuristic is dropped. We only count enabled
+    # users and flag environments with none.
     $foUsers = Invoke-FOOData `
-        -Path 'Users?$select=UserId,Alias,Enabled,NetworkAlias,Language,LastLoginDateTime,StartDateTime&$filter=Enabled eq true' `
-        -SectionLabel 'FO Active Users' `
+        -Path 'SystemUsers?$select=UserID,Alias,Enabled,Email,NetworkDomain,UserName,Language&$filter=Enabled eq Microsoft.Dynamics.DataEntities.NoYes''Yes''' `
+        -SectionLabel 'FO System Users' `
         -SaveFileName 'fo-users.json' `
         -Paginate
 
     if ($foUsers) {
         $foUsersArr = @($foUsers)
-        $since90   = (Get-Date).AddDays(-90)
-        $recentFO  = @($foUsersArr | Where-Object {
-            $_.LastLoginDateTime -and [datetime]$_.LastLoginDateTime -ge $since90
-        })
         $result.Sections['FOUsers'] = @{
             EnabledCount  = $foUsersArr.Count
-            ActiveLast90d = $recentFO.Count
+            ActiveLast90d = $null  # Not available via OData
             Notes         = @(
-                if ($foUsersArr.Count -gt 0 -and $recentFO.Count -eq 0) { 'FO_NO_ACTIVE_USERS_90D' }
                 if ($foUsersArr.Count -eq 0) { 'FO_NO_ENABLED_USERS' }
             ) | Where-Object { $_ }
         }
     }
 
-    # ── 9. FO Workflow Instances (pending/stuck) ──────────────────────────────
+    # ── 9. FO Workflow Work Items (pending/stuck) ─────────────────────────────
+    # Entity set is WorkflowWorkItems (not WorkflowInstances). $metadata fields:
+    # Id (key), Status (WorkflowWorkItemStatus enum: Pending/Delegated/Completed/Failed),
+    # Subject, DueDateTime, Description, UserId. No CreatedDateTime; we use
+    # DueDateTime to detect overdue work items as a proxy for "stalled".
     $foWF = Invoke-FOOData `
-        -Path "WorkflowInstances?`$select=WorkflowInstanceId,TemplateId,Status,Subject,CreatedDateTime,ModifiedDateTime&`$filter=Status eq 'Pending'&`$top=500" `
-        -SectionLabel 'FO Pending Workflow Instances' `
+        -Path "WorkflowWorkItems?`$select=Id,Status,Subject,DueDateTime,Description,UserId&`$filter=Status eq Microsoft.Dynamics.DataEntities.WorkflowWorkItemStatus'Pending'&`$top=500" `
+        -SectionLabel 'FO Pending Workflow Work Items' `
         -SaveFileName 'fo-pending-workflows.json'
 
     if ($foWF) {
         $foWFArr = @($foWF)
         $since30 = (Get-Date).AddDays(-30)
-        $oldPending = @($foWFArr | Where-Object {
-            $_.CreatedDateTime -and [datetime]$_.CreatedDateTime -lt $since30
+        $overdue30 = @($foWFArr | Where-Object {
+            $_.DueDateTime -and [datetime]$_.DueDateTime -lt $since30
         })
         $result.Sections['FOWorkflows'] = @{
             PendingCount   = $foWFArr.Count
-            OldPending30d  = $oldPending.Count
+            OldPending30d  = $overdue30.Count
             Notes          = @(
-                if ($oldPending.Count -gt 20) { "FO_MANY_STALLED_WORKFLOWS ($($oldPending.Count) pending >30d)" }
+                if ($overdue30.Count -gt 20) { "FO_MANY_STALLED_WORKFLOWS ($($overdue30.Count) pending with DueDate >30d ago)" }
             ) | Where-Object { $_ }
+        }
+    }
+
+    # ── 10. FO Entity Record Counts (storage concentration proxy) ────────────
+    # The CE-side collector skips mserp_* virtual tables because counting them via
+    # Dataverse hits the F&O federation layer — slow, fragile, and returns wrong
+    # PK names. Instead, we hit F&O's native OData directly for *every* entity set
+    # exposed by the F&O service document. config/fo-count-entities.json is used
+    # as an optional metadata enrichment source (Category/Why for known high-volume
+    # entities) but the authoritative list is whatever /data/ returns.
+    if ($IncludeEntityCounts) {
+        Write-InventoryLog '    [FO Entity Counts]...' -Indent 2
+        $foTraceList = [System.Collections.Generic.List[object]]::new()
+        try {
+            # Optional: load curated metadata so known entities get Category/Why tags.
+            $metaMap = @{}
+            $foCountsConfigPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'config\fo-count-entities.json'
+            if (Test-Path $foCountsConfigPath) {
+                try {
+                    $cfg = Get-Content $foCountsConfigPath -Raw | ConvertFrom-Json
+                    foreach ($ent in @($cfg.Entities)) {
+                        if ($ent.Name) {
+                            $metaMap[$ent.Name] = [PSCustomObject]@{
+                                Category = [string]$ent.Category
+                                Why      = [string]$ent.Why
+                            }
+                        }
+                    }
+                } catch {
+                    Write-InventoryLog "    -> metadata enrichment config unreadable: $_" -Level WARN -Indent 3
+                }
+            }
+
+            $token = Get-AzureToken -ResourceUrl "$FOBaseUrl/"
+            $headers = @{
+                Authorization      = "Bearer $token"
+                'OData-MaxVersion' = '4.0'
+                'OData-Version'    = '4.0'
+                Accept             = 'application/json'
+            }
+
+            # Enumerate every entity set advertised by the F&O OData service document.
+            $svcDocUri = "$FOBaseUrl/data/"
+            $svcSw = [System.Diagnostics.Stopwatch]::StartNew()
+            $svcErr = $null
+            $svcStatus = $null
+            try {
+                $svcDoc = Invoke-RestWithRetry -Uri $svcDocUri -Headers $headers -TimeoutSec 120
+                $svcStatus = 200
+            } catch {
+                $svcErr = "$($_.Exception.Message)"
+                if ($_.Exception -and $_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                    try { $svcStatus = [int]$_.Exception.Response.StatusCode } catch { }
+                }
+                throw
+            } finally {
+                $svcSw.Stop()
+                $foTraceList.Add([PSCustomObject]@{
+                    EntityName  = '<service-document>'
+                    Method      = 'GET'
+                    Uri         = $svcDocUri
+                    HttpStatus  = $svcStatus
+                    Outcome     = if ($svcErr) { 'Error' } else { 'Success' }
+                    RecordCount = $null
+                    ElapsedMs   = [int]$svcSw.ElapsedMilliseconds
+                    Error       = $svcErr
+                    Timestamp   = (Get-Date).ToUniversalTime().ToString('o')
+                })
+            }
+            $allEntries = @(@($svcDoc.value) | Where-Object { $_.name })
+            # Service doc kind defaults to EntitySet when absent; explicitly exclude FunctionImport / Singleton.
+            $entitySets = @($allEntries | Where-Object {
+                -not ($_.PSObject.Properties['kind']) -or -not $_.kind -or ($_.kind -eq 'EntitySet')
+            } | Sort-Object name)
+            Write-InventoryLog "    -> Discovered $($entitySets.Count) entity sets (of $($allEntries.Count) service-doc entries). Counting all..." -Indent 3
+
+            $countResults = [System.Collections.Generic.List[hashtable]]::new()
+            $skipped = 0
+            $total = $entitySets.Count
+            $progressEvery = [Math]::Max(50, [int]($total / 20))
+            $i = 0
+            foreach ($es in $entitySets) {
+                $i++
+                $name = [string]$es.name
+                if (-not $name) { continue }
+                Write-Progress -Activity 'Counting F&O entity records' `
+                               -Status "$name ($i/$total)" `
+                               -PercentComplete (($i / $total) * 100)
+                $uri = "$FOBaseUrl/data/$name`?`$count=true&`$top=0"
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $cnt = -1
+                $errMsg = $null
+                $httpStatus = $null
+                try {
+                    $resp = Invoke-RestWithRetry -Uri $uri -Headers $headers -TimeoutSec 60 -MaxRetries 2
+                    $httpStatus = 200
+                    if ($resp.PSObject.Properties['@odata.count']) {
+                        $cnt = [int64]$resp.'@odata.count'
+                    }
+                } catch {
+                    # Expected for many entities — not queryable, permission-scoped,
+                    # requires params, 400/403/404/500 all possible. Silent-skip in the
+                    # count summary, but every call is recorded in the trace file.
+                    $errMsg = "$($_.Exception.Message)"
+                    if ($_.Exception -and $_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                        try { $httpStatus = [int]$_.Exception.Response.StatusCode } catch { }
+                    }
+                }
+                $sw.Stop()
+
+                $foTraceList.Add([PSCustomObject]@{
+                    EntityName  = $name
+                    Method      = 'GET'
+                    Uri         = $uri
+                    HttpStatus  = $httpStatus
+                    Outcome     = if ($cnt -ge 0) { 'Success' } else { 'Error' }
+                    RecordCount = if ($cnt -ge 0) { $cnt } else { $null }
+                    ElapsedMs   = [int]$sw.ElapsedMilliseconds
+                    Error       = $errMsg
+                    Timestamp   = (Get-Date).ToUniversalTime().ToString('o')
+                })
+
+                if ($cnt -ge 0) {
+                    $meta = if ($metaMap.ContainsKey($name)) { $metaMap[$name] } else { $null }
+                    $countResults.Add(@{
+                        LogicalName = $name
+                        DisplayName = $name
+                        Category    = if ($meta) { $meta.Category } else { 'Other' }
+                        Why         = if ($meta) { $meta.Why }      else { '' }
+                        Source      = 'FO'
+                        RecordCount = $cnt
+                    })
+                } else {
+                    $skipped++
+                }
+                if (($i % $progressEvery) -eq 0) {
+                    Write-InventoryLog "       ... $i / $total  (counted=$($countResults.Count), skipped=$skipped)" -Level DEBUG -Indent 3
+                }
+            }
+            Write-Progress -Activity 'Counting F&O entity records' -Completed
+
+            $sorted = @($countResults | Sort-Object { [int64]$_.RecordCount } -Descending)
+            # Always write the file, even if empty, so the report can tell the pass ran
+            Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-entity-counts.json' -Data $sorted
+            Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-entity-counts.trace.json' -Data @($foTraceList)
+            $foTraceErrors = @($foTraceList | Where-Object { $_.Outcome -eq 'Error' }).Count
+            if ($foTraceErrors -gt 0) {
+                Write-InventoryLog "    -> $foTraceErrors F&O entity count error(s) - see fo-entity-counts.trace.json" -Level WARN -Indent 3
+            }
+
+            $result.Sections['FOEntityCounts'] = @{
+                Attempted       = $total
+                Counted         = $sorted.Count
+                SkippedOrFailed = $skipped
+                TopByRecordCount = @($sorted | Select-Object -First 10)
+                Notes           = @()
+            }
+            Write-InventoryLog "    -> Counted $($sorted.Count)/$total F&O entities ($skipped skipped)." -Level OK -Indent 3
+        } catch {
+            Write-InventoryLog "    -> FO entity counts failed: $_" -Level WARN -Indent 3
+            # Persist whatever we captured in the trace list even when the section bailed early.
+            if ($foTraceList.Count -gt 0) {
+                Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-entity-counts.trace.json' -Data @($foTraceList)
+            }
+            $result.Sections['FOEntityCounts'] = @{
+                Attempted = 0
+                Counted   = 0
+                Notes     = @("FO_ENTITY_COUNTS_FAILED")
+            }
         }
     }
 

@@ -17,6 +17,18 @@ $script:LogFile      = $null         # Set by calling script
 $script:OutputPath   = '.\data'      # Overridden by orchestrator
 $script:Verbose      = $false
 
+# ── API endpoint / version pins ─────────────────────────────────────────────────
+# Pinned in one place so schema drift becomes a one-line change.
+$script:BAPBaseUrl         = 'https://api.bap.microsoft.com'
+$script:PowerAppsApiUrl    = 'https://api.powerapps.com'
+$script:PowerAppsResource  = 'https://service.powerapps.com/'
+$script:GraphBaseUrl       = 'https://graph.microsoft.com/v1.0'
+$script:GraphResource      = 'https://graph.microsoft.com/'
+$script:BAPApiVersion      = '2021-04-01'
+$script:BAPApiVersionPrev  = '2024-05-01'
+$script:BAPApiVersion2022  = '2022-11-01'
+$script:PowerAppsApiVer    = '2022-11-01'
+
 # ── Logging ─────────────────────────────────────────────────────────────────────
 
 function Write-InventoryLog {
@@ -177,6 +189,71 @@ function Invoke-RestWithRetry {
     }
 }
 
+function Get-HttpErrorClassification {
+    <#
+    .SYNOPSIS
+        Classifies a caught exception from a REST call into a stable category.
+    .DESCRIPTION
+        Collectors previously recorded every REST failure as a generic
+        QUERY_FAILED note. This helper maps an exception to one of:
+          ACCESS_DENIED        - 401/403 (missing permission, token scope)
+          NOT_FOUND            - 404 (entity/endpoint absent on this env)
+          FEATURE_NOT_ENABLED  - 404 + body mentions 'not enabled' / 'not provisioned'
+          TIMEOUT              - request timeout (network-level)
+          RATE_LIMITED         - 429 (already retried upstream; still failed)
+          SERVER_ERROR         - 5xx (upstream instability)
+          INVALID_QUERY        - 400 with OData error code (bad filter / select)
+          UNKNOWN_ERROR        - anything else
+        The returned hashtable is intended to be placed directly into a
+        section's Notes array so downstream reporting can differentiate real
+        problems from "feature not in use on this SKU".
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $status = 0
+    try {
+        if ($ErrorRecord.Exception -and $ErrorRecord.Exception.Response) {
+            $status = [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    } catch {}
+
+    $body = ''
+    try { $body = $ErrorRecord.ErrorDetails.Message } catch {}
+    if (-not $body) {
+        try { $body = $ErrorRecord.Exception.Message } catch {}
+    }
+    if (-not $body) { $body = '' }
+
+    $category = switch ($status) {
+        401 { 'ACCESS_DENIED' }
+        403 { 'ACCESS_DENIED' }
+        404 {
+            if ($body -match 'not enabled|not provisioned|not configured|not available') {
+                'FEATURE_NOT_ENABLED'
+            } else { 'NOT_FOUND' }
+        }
+        408 { 'TIMEOUT' }
+        429 { 'RATE_LIMITED' }
+        default {
+            if ($status -ge 500 -and $status -lt 600) { 'SERVER_ERROR' }
+            elseif ($status -eq 400) { 'INVALID_QUERY' }
+            elseif ($body -match 'timeout|timed out|operation has timed out') { 'TIMEOUT' }
+            else { 'UNKNOWN_ERROR' }
+        }
+    }
+
+    # First line of the body (usually the most actionable) for context in reports.
+    $firstLine = ($body -split "`r?`n" | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+    if ($firstLine -and $firstLine.Length -gt 280) { $firstLine = $firstLine.Substring(0, 280) + '...' }
+
+    return @{
+        Category = $category
+        Status   = $status
+        Message  = $firstLine
+    }
+}
+
 function Invoke-BAPRequest {
     <#
     .SYNOPSIS
@@ -199,9 +276,9 @@ function Invoke-BAPRequest {
         [int]   $TimeoutSec  = 120
     )
 
-    $token = Get-AzureToken -ResourceUrl 'https://service.powerapps.com/'
+    $token = Get-AzureToken -ResourceUrl $script:PowerAppsResource
     $sep   = if ($Path -match '\?') { '&' } else { '?' }
-    $uri   = "https://api.bap.microsoft.com$Path${sep}api-version=$ApiVersion"
+    $uri   = "$($script:BAPBaseUrl)$Path${sep}api-version=$ApiVersion"
     if ($ExtraQuery) { $uri += "&$ExtraQuery" }
 
     $headers = @{
@@ -213,6 +290,110 @@ function Invoke-BAPRequest {
 
     return Invoke-RestWithRetry -Uri $uri -Headers $headers -Method $Method `
                                 -Body $Body -TimeoutSec $TimeoutSec
+}
+
+function Invoke-PowerAppsAdminRequest {
+    <#
+    .SYNOPSIS
+        Calls the PowerApps Admin API (api.powerapps.com) — distinct host from
+        api.bap.microsoft.com. Some maker-surface endpoints (apps, flows v2,
+        connections) return richer data here than via BAP.
+    .PARAMETER Path
+        Path after the host, e.g.
+        "/providers/Microsoft.PowerApps/scopes/admin/environments/{id}/apps"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ApiVersion = $script:PowerAppsApiVer,
+        [string]$ExtraQuery = '',
+        [string]$Method     = 'GET',
+        [object]$Body       = $null,
+        [int]   $TimeoutSec = 120
+    )
+
+    $token = Get-AzureToken -ResourceUrl $script:PowerAppsResource
+    $sep   = if ($Path -match '\?') { '&' } else { '?' }
+    $uri   = "$($script:PowerAppsApiUrl)$Path${sep}api-version=$ApiVersion"
+    if ($ExtraQuery) { $uri += "&$ExtraQuery" }
+
+    $headers = @{
+        Authorization  = "Bearer $token"
+        'Content-Type' = 'application/json'
+    }
+
+    Write-InventoryLog "PowerAppsAdmin GET $uri" -Level DEBUG
+
+    return Invoke-RestWithRetry -Uri $uri -Headers $headers -Method $Method `
+                                -Body $Body -TimeoutSec $TimeoutSec
+}
+
+function Invoke-GraphRequest {
+    <#
+    .SYNOPSIS
+        Calls Microsoft Graph v1.0. Used for resolving AAD groups, users, and
+        service principals that Dataverse/BAP only reference by object id.
+    .PARAMETER Path
+        Relative path, e.g. "/groups/{id}" or "/users/{id}?$select=id,displayName".
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Method     = 'GET',
+        [object]$Body       = $null,
+        [int]   $TimeoutSec = 60
+    )
+
+    $token = Get-AzureToken -ResourceUrl $script:GraphResource
+    $uri   = "$($script:GraphBaseUrl)$Path"
+    $headers = @{
+        Authorization  = "Bearer $token"
+        'Content-Type' = 'application/json'
+    }
+    Write-InventoryLog "Graph GET $uri" -Level DEBUG
+    return Invoke-RestWithRetry -Uri $uri -Headers $headers -Method $Method `
+                                -Body $Body -TimeoutSec $TimeoutSec
+}
+
+function Get-AllBAPPages {
+    <#
+    .SYNOPSIS
+        Follows @odata.nextLink / nextLink pagination on BAP/PowerApps Admin
+        responses. Returns all records as a flat list.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$InitialResponse,
+        [int]$MaxPages = 50
+    )
+
+    $all  = [System.Collections.Generic.List[object]]::new()
+    $resp = $InitialResponse
+    $page = 1
+
+    while ($true) {
+        if ($resp -and $resp.PSObject.Properties.Name -contains 'value' -and $resp.value) {
+            $all.AddRange([object[]]$resp.value)
+        }
+
+        $nextLink = $null
+        if ($resp) {
+            foreach ($linkProp in '@odata.nextLink','nextLink') {
+                if ($resp.PSObject.Properties[$linkProp] -and $resp.$linkProp) {
+                    $nextLink = $resp.$linkProp
+                    break
+                }
+            }
+        }
+        if (-not $nextLink -or $page -ge $MaxPages) { break }
+
+        $token   = Get-AzureToken -ResourceUrl $script:PowerAppsResource
+        $headers = @{ Authorization = "Bearer $token" }
+        $resp    = Invoke-RestWithRetry -Uri $nextLink -Headers $headers
+        $page++
+    }
+
+    return ,$all
 }
 
 function Invoke-DataverseRequest {
@@ -285,9 +466,16 @@ function Get-AllODataPages {
     $resp  = $InitialResponse
 
     while ($true) {
-        if ($resp.value) { $all.AddRange([object[]]$resp.value) }
+        if ($resp -and $resp.PSObject.Properties.Name -contains 'value' -and $resp.value) {
+            $all.AddRange([object[]]$resp.value)
+        }
 
-        $nextLink = $resp.'@odata.nextLink'
+        # Under Set-StrictMode -Version Latest, accessing a missing property throws,
+        # so we probe via PSObject.Properties before reading the nextLink.
+        $nextLink = $null
+        if ($resp -and $resp.PSObject.Properties['@odata.nextLink']) {
+            $nextLink = $resp.'@odata.nextLink'
+        }
         if (-not $nextLink -or $page -ge $MaxPages) { break }
 
         Write-InventoryLog "  Fetching page $($page + 1) ($($all.Count) records so far)..." -Level DEBUG
@@ -350,7 +538,10 @@ function Save-EnvironmentData {
     }
 
     $outPath = Join-Path $EnvironmentDir $FileName
-    $Data | ConvertTo-Json -Depth 15 -Compress:$false | Set-Content -Path $outPath -Encoding UTF8 -Force
+    # Use -InputObject instead of piping. Piping enumerates arrays and PS 5.1's
+    # ConvertTo-Json then wraps multi-element pipeline input as {value:[...],Count:N}
+    # rather than a bare JSON array, which breaks any reader expecting an array.
+    ConvertTo-Json -InputObject $Data -Depth 15 -Compress:$false | Set-Content -Path $outPath -Encoding UTF8 -Force
     Write-InventoryLog "  Saved: $outPath" -Level DEBUG
 }
 
@@ -367,7 +558,8 @@ function Save-RootData {
         $null = New-Item -ItemType Directory -Path $script:OutputPath -Force
     }
     $outPath = Join-Path $script:OutputPath $FileName
-    $Data | ConvertTo-Json -Depth 15 | Set-Content -Path $outPath -Encoding UTF8 -Force
+    # See Save-EnvironmentData for why -InputObject (not pipe) is required here.
+    ConvertTo-Json -InputObject $Data -Depth 15 | Set-Content -Path $outPath -Encoding UTF8 -Force
     Write-InventoryLog "Saved: $outPath" -Level DEBUG
 }
 
@@ -377,7 +569,10 @@ function Get-DataverseEntityCount {
     <#
     .SYNOPSIS
         Returns the OData count for an entity set without retrieving any records.
-        Returns -1 if the count cannot be retrieved (security/timeout).
+    .DESCRIPTION
+        Returns a PSCustomObject with Uri, Count, Error, HttpStatus, ElapsedMs so
+        callers can both read the count and write a trace log entry. Count is -1
+        when the call fails.
     #>
     [CmdletBinding()]
     param(
@@ -387,11 +582,18 @@ function Get-DataverseEntityCount {
         [int]   $TimeoutSec  = 60
     )
 
+    # $count=true returns the total via @odata.count; $top=1 bounds the sample row.
+    # We intentionally omit $select: naive pluralization rules (e.g. stripping a
+    # trailing 's') produce invalid PK names for tables whose set ends in 'ies'
+    # (F&O virtual tables like mserp_*entities), causing every count to 400.
+    $uri   = "$($InstanceApiUrl.TrimEnd('/'))/api/data/v9.2/${EntitySetName}?`$count=true&`$top=1"
+    $sw    = [System.Diagnostics.Stopwatch]::StartNew()
+    $cnt        = -1
+    $errMsg     = $null
+    $httpStatus = $null
+
     try {
         $token = Get-AzureToken -ResourceUrl ($InstanceUrl.TrimEnd('/') + '/')
-        $uri   = "$($InstanceApiUrl.TrimEnd('/'))/api/data/v9.2/${EntitySetName}?`$count=true&`$top=1&`$select=$(($EntitySetName -replace 's$','') + 'id')"
-
-        # Fallback: if field derivation fails, use a minimal fetch
         $headers = @{
             Authorization      = "Bearer $token"
             'OData-MaxVersion' = '4.0'
@@ -401,12 +603,29 @@ function Get-DataverseEntityCount {
         }
 
         $resp = Invoke-RestWithRetry -Uri $uri -Headers $headers -TimeoutSec $TimeoutSec
-        if ($null -ne $resp.'@odata.count') { return [int]$resp.'@odata.count' }
-        if ($resp.value) { return $resp.value.Count }
-        return 0
+        $httpStatus = 200
+        if ($null -ne $resp.'@odata.count') {
+            $cnt = [int64]$resp.'@odata.count'
+        } elseif ($resp.value) {
+            $cnt = [int64]$resp.value.Count
+        } else {
+            $cnt = 0
+        }
     }
     catch {
-        return -1
+        $errMsg = "$($_.Exception.Message)"
+        if ($_.Exception -and $_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            try { $httpStatus = [int]$_.Exception.Response.StatusCode } catch { }
+        }
+    }
+    $sw.Stop()
+
+    [PSCustomObject]@{
+        Uri        = $uri
+        Count      = $cnt
+        Error      = $errMsg
+        HttpStatus = $httpStatus
+        ElapsedMs  = [int]$sw.ElapsedMilliseconds
     }
 }
 
@@ -500,9 +719,13 @@ Export-ModuleMember -Function @(
     'Set-InventoryLogFile'
     'Set-InventoryOutputPath'
     'Get-AzureToken'
+    'Get-HttpErrorClassification'
     'Invoke-BAPRequest'
+    'Invoke-PowerAppsAdminRequest'
+    'Invoke-GraphRequest'
     'Invoke-DataverseRequest'
     'Get-AllODataPages'
+    'Get-AllBAPPages'
     'Save-EnvironmentData'
     'Save-RootData'
     'Get-SafeDirectoryName'

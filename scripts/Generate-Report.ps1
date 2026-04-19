@@ -58,7 +58,14 @@ if (-not (Test-Path $masterFile)) {
 }
 $master = Get-Content $masterFile -Raw | ConvertFrom-Json
 
-# ── Load per-environment CE summaries ─────────────────────────────────────────
+# ── Load tenant-level governance (once) ───────────────────────────────────────
+$tenantGov = $null
+$tenantGovFile = Join-Path $DataPath 'tenant\governance-summary.json'
+if (Test-Path $tenantGovFile) {
+    try { $tenantGov = Get-Content $tenantGovFile -Raw | ConvertFrom-Json } catch {}
+}
+
+# ── Load per-environment summaries ────────────────────────────────────────────
 $envDetails = [System.Collections.Generic.List[PSObject]]::new()
 
 foreach ($envEntry in $master.Environments) {
@@ -69,8 +76,20 @@ foreach ($envEntry in $master.Environments) {
     $foSummaryFile = Join-Path $outDir 'fo-summary.json'
     $metaFile      = Join-Path $outDir 'metadata.json'
 
+    # New collector summaries (Phase 1-5)
+    $makerFile     = Join-Path $outDir 'maker-summary.json'
+    $govFile       = Join-Path $outDir 'governance-summary.json'
+    $rbacFile      = Join-Path $outDir 'rbac-summary.json'
+    $mdFile        = Join-Path $outDir 'metadata-depth-summary.json'
+    $actFile       = Join-Path $outDir 'activity-summary.json'
+
     $ceSummary = if (Test-Path $ceSummaryFile) { Get-Content $ceSummaryFile -Raw | ConvertFrom-Json } else { $null }
     $foSummary = if (Test-Path $foSummaryFile) { Get-Content $foSummaryFile -Raw | ConvertFrom-Json } else { $null }
+    $maker     = if (Test-Path $makerFile)     { Get-Content $makerFile     -Raw | ConvertFrom-Json } else { $null }
+    $gov       = if (Test-Path $govFile)       { Get-Content $govFile       -Raw | ConvertFrom-Json } else { $null }
+    $rbac      = if (Test-Path $rbacFile)      { Get-Content $rbacFile      -Raw | ConvertFrom-Json } else { $null }
+    $md        = if (Test-Path $mdFile)        { Get-Content $mdFile        -Raw | ConvertFrom-Json } else { $null }
+    $activity  = if (Test-Path $actFile)       { Get-Content $actFile       -Raw | ConvertFrom-Json } else { $null }
 
     $detail = [PSCustomObject]@{
         EnvironmentId   = $envEntry.EnvironmentId
@@ -89,6 +108,11 @@ foreach ($envEntry in $master.Environments) {
         AllFlags        = @($envEntry.AllFlags)
         CE              = $ceSummary
         FO              = $foSummary
+        Maker           = $maker
+        Governance      = $gov
+        RBAC            = $rbac
+        MetadataDepth   = $md
+        Activity        = $activity
         HasError        = ($null -ne $envEntry.Error)
         ErrorMsg        = $envEntry.Error
     }
@@ -171,6 +195,7 @@ $issueCategories = [ordered]@{
     'Many Unmanaged Solutions' = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'HIGH_UNMANAGED' } })
     'FO Batch Errors'          = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'FO_BATCH_JOBS_IN_ERROR' } })
     'FO Missing Cleanup Jobs'  = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'FO_MISSING_CLEANUP' } })
+    'FO Cleanup Jobs Disabled' = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'FO_CLEANUP_JOBS_NOT_ENABLED|FO_CLEANUP_JOBS_IN_ERROR' } })
     'DualWrite Map Errors'     = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'DUALWRITE_MAPS_IN_ERROR' } })
     'Broken Connection Refs'   = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'BROKEN_CONNECTION_REFERENCES' } })
     'Flows: Disabled Owners'   = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'ACTIVE_FLOWS_OWNED_BY_DISABLED' } })
@@ -599,6 +624,8 @@ foreach ($e in $foEnvs) {
     $bjCount     = if ($foSec -and $foSec.BatchJobs) { $foSec.BatchJobs.TotalCount  } else { 'N/A' }
     $bjError     = if ($foSec -and $foSec.BatchJobs) { $foSec.BatchJobs.ErrorCount  } else { 'N/A' }
     $missingClnp = if ($foSec -and $foSec.FOCleanupJobs) { $foSec.FOCleanupJobs.MissingStandardJobs.Count } else { 'N/A' }
+    $disabledClnp = if ($foSec -and $foSec.FOCleanupJobs) { [int]$foSec.FOCleanupJobs.FoundButAllDisabled } else { 'N/A' }
+    $errorClnp    = if ($foSec -and $foSec.FOCleanupJobs) { [int]$foSec.FOCleanupJobs.FoundInErrorOnly    } else { 'N/A' }
     $foUsers     = if ($foSec -and $foSec.FOUsers)  { $foSec.FOUsers.EnabledCount    } else { 'N/A' }
     $foActive90  = if ($foSec -and $foSec.FOUsers)  { $foSec.FOUsers.ActiveLast90d   } else { 'N/A' }
     $dwMaps      = if ($foSec -and $foSec.DualWrite) { $foSec.DualWrite.MapCount     } else { 'N/A' }
@@ -606,12 +633,17 @@ foreach ($e in $foEnvs) {
     $foFlags     = @($e.AllFlags | Where-Object { $_ -match '^FO_|^DUALWRITE' })
     $flagsHtml   = Get-FlagBadgeHtml -Flags $foFlags
 
+    $disabledCell = if ($disabledClnp -eq 'N/A') { 'N/A' } elseif ($disabledClnp -gt 0) { "<span class='text-warning fw-bold'>$disabledClnp</span>" } else { "$disabledClnp" }
+    $errorCell    = if ($errorClnp -eq 'N/A')    { 'N/A' } elseif ($errorClnp -gt 0)    { "<span class='text-danger fw-bold'>$errorClnp</span>"    } else { "$errorClnp" }
+
     $foTableRows += @"
 <tr>
   <td>$nameEsc<br><small class='text-muted'>$($e.Sku)</small></td>
   <td>$bjCount</td>
   <td><span class='$(if ($bjError -gt 0) {"text-danger fw-bold"} else {""})'>$bjError</span></td>
   <td>$missingClnp</td>
+  <td>$disabledCell</td>
+  <td>$errorCell</td>
   <td>$foUsers</td>
   <td>$foActive90</td>
   <td>$dwMaps</td>
@@ -631,12 +663,45 @@ $envsWithCounts    = [System.Collections.Generic.List[PSObject]]::new()
 
 foreach ($envEntry in $master.Environments) {
     if (-not $envEntry.OutputDir) { continue }
-    $countsFile = Join-Path $envEntry.OutputDir 'entity-counts.json'
-    if (-not (Test-Path $countsFile)) { continue }
+    $countsFile   = Join-Path $envEntry.OutputDir 'entity-counts.json'
+    $foCountsFile = Join-Path $envEntry.OutputDir 'fo-entity-counts.json'
 
-    $counts = Get-Content $countsFile -Raw | ConvertFrom-Json
-    if (-not $counts) { continue }
-    $countsArr = @($counts)
+    # Historical bug: some entity-count files were serialized as {"value":[...],"Count":N}
+    # instead of a bare JSON array, because ConvertTo-Json treats piped multi-element
+    # arrays that way under PS 5.1. Unwrap transparently so legacy data still loads.
+    function _Unwrap-CountArray {
+        param($raw)
+        if ($null -eq $raw) { return @() }
+        if ($raw -is [System.Array]) { return $raw }
+        if ($raw.PSObject.Properties.Name -contains 'value' -and ($raw.value -is [System.Array])) {
+            return $raw.value
+        }
+        return @($raw)
+    }
+
+    $ceCounts = @()
+    if (Test-Path $countsFile) {
+        $ceRaw = Get-Content $countsFile -Raw | ConvertFrom-Json
+        $ceCounts = @(_Unwrap-CountArray $ceRaw)
+    }
+
+    $foCounts = @()
+    if (Test-Path $foCountsFile) {
+        $foRaw = Get-Content $foCountsFile -Raw | ConvertFrom-Json
+        $foArr = @(_Unwrap-CountArray $foRaw)
+        # Normalize: older F&O rows may lack Source; tag anything from this file as F&O.
+        $foCounts = @($foArr | ForEach-Object {
+            $obj = $_
+            if (-not ($obj.PSObject.Properties.Name -contains 'Source') -or -not $obj.Source) {
+                $obj | Add-Member -NotePropertyName Source -NotePropertyValue 'FO' -Force
+            }
+            $obj
+        })
+    }
+
+    $countsArr = @()
+    if ($ceCounts.Count -gt 0) { $countsArr += $ceCounts }
+    if ($foCounts.Count -gt 0) { $countsArr += $foCounts }
     if ($countsArr.Count -eq 0) { continue }
 
     $top25       = @($countsArr | Sort-Object -Property RecordCount -Descending | Select-Object -First 25)
@@ -672,7 +737,10 @@ foreach ($envInfo in $envsWithCountsSorted) {
         $ln = [System.Web.HttpUtility]::HtmlEncode([string]$t.LogicalName)
         $dnRaw = if ($t.DisplayName) { [string]$t.DisplayName } else { [string]$t.LogicalName }
         $dn = [System.Web.HttpUtility]::HtmlEncode($dnRaw)
-        $typeBadge = if ($t.IsCustom) {
+        $isFO = ($t.PSObject.Properties.Name -contains 'Source') -and ($t.Source -eq 'FO')
+        $typeBadge = if ($isFO) {
+            "<span class='badge bg-warning text-dark'>F&amp;O</span>"
+        } elseif ($t.IsCustom) {
             "<span class='badge bg-info text-dark'>Custom</span>"
         } else {
             "<span class='badge bg-secondary'>OOB</span>"
@@ -881,6 +949,224 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
 
 Write-Host "  Storage cleanup recommendations: $cleanupRecCount across $($envDetails.Count) environments" -ForegroundColor Cyan
 
+# ── Tenant Governance / DLP section ───────────────────────────────────────────
+$tenantGovHtml = if ($tenantGov) {
+    $dlpSec  = $tenantGov.Sections.DlpPolicies
+    $tsSec   = $tenantGov.Sections.TenantSettings
+    $tiSec   = $tenantGov.Sections.TenantIsolation
+    $erSec   = $tenantGov.Sections.EnvironmentRequests
+
+    $dlpRowsHtml = ''
+    if ($dlpSec -and $dlpSec.Policies) {
+        foreach ($p in $dlpSec.Policies) {
+            $scopeBadge = switch ($p.Scope) {
+                'AllEnvironments' { '<span class="badge bg-primary">All</span>' }
+                'AllExcept'       { "<span class=`"badge bg-info text-dark`">All Except ($($p.EnvironmentsExcluded.Count))</span>" }
+                'Specific'        { "<span class=`"badge bg-secondary`">Specific ($($p.EnvironmentsIncluded.Count))</span>" }
+                default           { '<span class="badge bg-warning text-dark">Unknown</span>' }
+            }
+            $httpBadge = if ($p.HttpAllowedInNonBusiness) {
+                '<span class="badge bg-danger">HTTP in Non-Business</span>'
+            } else { '<span class="badge bg-success">HTTP blocked</span>' }
+            $dlpRowsHtml += "<tr><td>$([System.Web.HttpUtility]::HtmlEncode([string]$p.DisplayName))</td><td>$scopeBadge</td><td>$($p.BusinessCount)</td><td>$($p.NonBusinessCount)</td><td>$($p.BlockedCount)</td><td>$httpBadge</td></tr>"
+        }
+    }
+    $dlpTable = if ($dlpRowsHtml) {
+        "<table class='table table-sm table-bordered'><thead class='table-dark'><tr><th>Policy</th><th>Scope</th><th>Business</th><th>Non-Business</th><th>Blocked</th><th>HTTP</th></tr></thead><tbody>$dlpRowsHtml</tbody></table>"
+    } else {
+        "<div class='alert alert-warning'>No DLP policies configured in this tenant.</div>"
+    }
+
+    $isolBadge = if ($tiSec -and $tiSec.Enabled) { '<span class="badge bg-success">Enabled</span>' } else { '<span class="badge bg-danger">Disabled</span>' }
+    $isolNote  = if ($tiSec) { "Allowed inbound tenants: $($tiSec.AllowedInbound.Count); outbound: $($tiSec.AllowedOutbound.Count)" } else { 'Not queried' }
+
+    $envCreateBadge = if ($tsSec -and $tsSec.DisableEnvironmentCreationByNonAdmin) {
+        '<span class="badge bg-success">Admin-only</span>'
+    } elseif ($tsSec) {
+        '<span class="badge bg-warning text-dark">Open to all users</span>'
+    } else { '<span class="badge bg-secondary">Unknown</span>' }
+
+    $pendingBadge = if ($erSec) {
+        $pc = [int]$erSec.PendingCount
+        if ($pc -gt 10) { "<span class='badge bg-warning text-dark'>$pc pending</span>" }
+        elseif ($pc -gt 0) { "<span class='badge bg-info text-dark'>$pc pending</span>" }
+        else { '<span class="badge bg-success">0 pending</span>' }
+    } else { '<span class="badge bg-secondary">N/A</span>' }
+
+@"
+<section id="tenant-gov" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Tenant Governance &amp; DLP</h5></div>
+  <p class="text-muted small">Tenant-scoped Power Platform governance posture: DLP policies, tenant isolation, environment creation controls. Source: <code>data/tenant/*.json</code>.</p>
+  <div class="row g-3 mb-3">
+    <div class="col-md-3">
+      <div class="card p-2"><div class="small text-muted">DLP Policies</div><div class="h4">$([int]$dlpSec.TotalCount)</div></div>
+    </div>
+    <div class="col-md-3">
+      <div class="card p-2"><div class="small text-muted">Tenant Isolation</div><div class="h5 pt-1">$isolBadge</div></div>
+    </div>
+    <div class="col-md-3">
+      <div class="card p-2"><div class="small text-muted">Env Creation</div><div class="h5 pt-1">$envCreateBadge</div></div>
+    </div>
+    <div class="col-md-3">
+      <div class="card p-2"><div class="small text-muted">Pending Env Requests</div><div class="h5 pt-1">$pendingBadge</div></div>
+    </div>
+  </div>
+  <h6 class="mt-3">DLP Policies</h6>
+  $dlpTable
+  <p class="small text-muted mt-2">Tenant isolation detail: $isolNote</p>
+</section>
+"@
+} else {
+    "<section id='tenant-gov' class='mb-5'><div class='section-header'><h5 class='mb-0'>Tenant Governance &amp; DLP</h5></div><div class='alert alert-secondary'>No tenant governance data available. Re-run with <code>-IncludeGovernance</code>.</div></section>"
+}
+
+# ── Maker Inventory section ───────────────────────────────────────────────────
+$makerRowsHtml = ''
+foreach ($e in ($envDetails | Where-Object { $_.Maker })) {
+    $m = $e.Maker.Sections
+    $nameEsc = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+    $canvas  = [int]$m.CanvasApps.TotalCount
+    $orphAps = [int]$m.CanvasApps.OrphanedCount
+    $flows   = [int]$m.CloudFlows.TotalCount
+    $susp    = [int]$m.CloudFlows.SuspendedCount
+    $conns   = [int]$m.Connections.TotalCount
+    $errConn = [int]$m.Connections.InErrorCount
+    $custCn  = [int]$m.CustomConnectors.TotalCount
+    $ppages  = [int]$m.PowerPages.TotalCount
+    $bots    = [int]$m.Copilots.TotalCount
+    $dfs     = [int]$m.Dataflows.TotalCount
+    $ai      = [int]$m.AIModels.TotalCount
+    $makerRowsHtml += @"
+<tr>
+  <td>$nameEsc<br><small class='text-muted'>$($e.Sku)</small></td>
+  <td>$canvas$(if ($orphAps -gt 0) { " <span class='badge bg-danger'>$orphAps orphaned</span>" })</td>
+  <td>$flows$(if ($susp -gt 0) { " <span class='badge bg-warning text-dark'>$susp susp</span>" })</td>
+  <td>$conns$(if ($errConn -gt 0) { " <span class='badge bg-danger'>$errConn err</span>" })</td>
+  <td>$custCn</td>
+  <td>$ppages</td>
+  <td>$bots</td>
+  <td>$dfs</td>
+  <td>$ai</td>
+</tr>
+"@
+}
+
+$makerHtml = if ($makerRowsHtml) {
+@"
+<section id="maker" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Maker Inventory</h5></div>
+  <p class="text-muted small">Per-environment count of maker-created assets: canvas apps, cloud flows, connections, custom connectors, Power Pages, Copilot Studio bots, dataflows, AI Builder models. Source: <code>maker-summary.json</code> per env.</p>
+  <div class="table-responsive">
+    <table id="makerTable" class="table table-sm table-hover table-bordered" style="width:100%">
+      <thead class="table-dark"><tr>
+        <th>Environment</th><th>Canvas Apps</th><th>Cloud Flows</th><th>Connections</th><th>Custom Connectors</th><th>Power Pages</th><th>Copilots</th><th>Dataflows</th><th>AI Models</th>
+      </tr></thead>
+      <tbody>$makerRowsHtml</tbody>
+    </table>
+  </div>
+</section>
+"@
+} else {
+    "<section id='maker' class='mb-5'><div class='section-header'><h5 class='mb-0'>Maker Inventory</h5></div><div class='alert alert-secondary'>No maker inventory data. Re-run with <code>-IncludeMakerInventory</code>.</div></section>"
+}
+
+# ── RBAC Summary section ──────────────────────────────────────────────────────
+$rbacRowsHtml = ''
+foreach ($e in ($envDetails | Where-Object { $_.RBAC })) {
+    $r = $e.RBAC.Sections
+    $nameEsc = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+    $roles   = [int]$r.SecurityRoles.TotalCount
+    $custom  = [int]$r.SecurityRoles.CustomCount
+    $bus     = [int]$r.BusinessUnits.TotalCount
+    $depth   = [int]$r.BusinessUnits.MaxDepth
+    $teams   = [int]$r.Teams.TotalCount
+    $fsp     = [int]$r.FieldSecurityProfiles.TotalCount
+    $sysAdmin = [int]$r.UserRoleAssignments.UsersWithSystemAdmin
+    $sampU   = [int]$r.UserRoleAssignments.SampledUserCount
+    $adminBadge = if ($sysAdmin -gt 10 -and $e.Sku -eq 'Production') {
+        "<span class='badge bg-danger'>$sysAdmin / $sampU</span>"
+    } elseif ($sysAdmin -gt 0) {
+        "<span class='badge bg-secondary'>$sysAdmin / $sampU</span>"
+    } else { '<span class="text-muted small">0</span>' }
+    $rbacRowsHtml += @"
+<tr>
+  <td>$nameEsc<br><small class='text-muted'>$($e.Sku)</small></td>
+  <td>$roles <small class='text-muted'>($custom custom)</small></td>
+  <td>$bus <small class='text-muted'>(depth $depth)</small></td>
+  <td>$teams</td>
+  <td>$fsp</td>
+  <td>$adminBadge</td>
+</tr>
+"@
+}
+
+$rbacHtml = if ($rbacRowsHtml) {
+@"
+<section id="rbac" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">RBAC Summary</h5></div>
+  <p class="text-muted small">Per-environment access control depth: security roles, business units, teams, field security profiles, and sampled system admin assignment density. Source: <code>rbac-summary.json</code>.</p>
+  <div class="table-responsive">
+    <table id="rbacTable" class="table table-sm table-hover table-bordered" style="width:100%">
+      <thead class="table-dark"><tr>
+        <th>Environment</th><th>Security Roles</th><th>Business Units</th><th>Teams</th><th>FSPs</th><th>Users w/ SysAdmin (sampled)</th>
+      </tr></thead>
+      <tbody>$rbacRowsHtml</tbody>
+    </table>
+  </div>
+</section>
+"@
+} else {
+    "<section id='rbac' class='mb-5'><div class='section-header'><h5 class='mb-0'>RBAC Summary</h5></div><div class='alert alert-secondary'>No RBAC data. Re-run with <code>-IncludeRBAC</code>.</div></section>"
+}
+
+# ── Metadata Depth section ────────────────────────────────────────────────────
+$mdRowsHtml = ''
+foreach ($e in ($envDetails | Where-Object { $_.MetadataDepth })) {
+    $m = $e.MetadataDepth.Sections
+    $nameEsc = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+    $dvVer    = if ($m.Organization) { $m.Organization.Version } else { 'N/A' }
+    $pubs     = [int]$m.Publishers.TotalCount
+    $pubsCust = [int]$m.Publishers.CustomCount
+    $d365     = [int]$m.D365Apps.TotalCount
+    $curr     = [int]$m.Currencies.TotalCount
+    $langs    = [int]$m.Languages.ProvisionedCount
+    $backups  = [int]$m.Backups.TotalCount
+    $lcOps    = [int]$m.LifecycleOperations.Recent30dCount
+    $lcFail   = [int]$m.LifecycleOperations.Failed30dCount
+    $lcBadge  = if ($lcFail -gt 0) { "<span class='badge bg-danger'>$lcFail failed</span>" } else { "$lcOps recent" }
+    $mdRowsHtml += @"
+<tr>
+  <td>$nameEsc<br><small class='text-muted'>$($e.Sku)</small></td>
+  <td><code>$dvVer</code></td>
+  <td>$pubs <small class='text-muted'>($pubsCust custom)</small></td>
+  <td>$d365</td>
+  <td>$curr</td>
+  <td>$langs</td>
+  <td>$backups</td>
+  <td>$lcBadge</td>
+</tr>
+"@
+}
+
+$mdHtml = if ($mdRowsHtml) {
+@"
+<section id="metadata-depth" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Metadata &amp; Lifecycle</h5></div>
+  <p class="text-muted small">Per-environment metadata inventory: Dataverse version, publishers, installed D365 apps, currencies, languages, backups, lifecycle operations. Source: <code>metadata-depth-summary.json</code>.</p>
+  <div class="table-responsive">
+    <table id="mdTable" class="table table-sm table-hover table-bordered" style="width:100%">
+      <thead class="table-dark"><tr>
+        <th>Environment</th><th>DV Version</th><th>Publishers</th><th>D365 Apps</th><th>Currencies</th><th>Languages</th><th>Backups</th><th>Lifecycle Ops (30d)</th>
+      </tr></thead>
+      <tbody>$mdRowsHtml</tbody>
+    </table>
+  </div>
+</section>
+"@
+} else {
+    "<section id='metadata-depth' class='mb-5'><div class='section-header'><h5 class='mb-0'>Metadata &amp; Lifecycle</h5></div><div class='alert alert-secondary'>No metadata depth data. Re-run with <code>-IncludeMetadataDepth</code>.</div></section>"
+}
+
 # ── HTML template ─────────────────────────────────────────────────────────────
 $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 $tenantId    = $master.TenantId
@@ -928,6 +1214,10 @@ $html = @"
         <a href="#issues">Issue Overview</a>
         <a href="#delta">Changes (Delta)</a>
         <a href="#governance">Governance Scores</a>
+        <a href="#tenant-gov">Tenant Governance / DLP</a>
+        <a href="#maker">Maker Inventory</a>
+        <a href="#rbac">RBAC Summary</a>
+        <a href="#metadata-depth">Metadata &amp; Lifecycle</a>
         <a href="#all-envs">All Environments</a>
         <a href="#storage">Storage Analysis</a>
         <a href="#cleanup">Cleanup Gaps</a>
@@ -1055,6 +1345,14 @@ $deltaHtml
     <tbody>$govTableRows</tbody>
   </table>
 </section>
+
+$tenantGovHtml
+
+$makerHtml
+
+$rbacHtml
+
+$mdHtml
 
 <!-- ALL ENVIRONMENTS -->
 <section id="all-envs" class="mb-5">
@@ -1245,7 +1543,9 @@ $(
         <th>Environment</th>
         <th>FO Batch Jobs</th>
         <th>Jobs in Error</th>
-        <th>Missing Cleanup Jobs</th>
+        <th title='Standard cleanup jobs where no batch job description matches the expected pattern'>Missing Cleanup Jobs</th>
+        <th title='Cleanup jobs that exist but are Withheld/Canceled with no active schedule'>Cleanup Disabled</th>
+        <th title='Cleanup jobs whose only matching batch job is in Error state'>Cleanup in Error</th>
         <th>FO Users</th>
         <th>Active (90d)</th>
         <th>DualWrite Maps</th>
@@ -1285,6 +1585,11 @@ $(
     <tr><th>Collection Errors</th><td>$($master.Errors)</td></tr>
     <tr><th>FO Collection Included</th><td>$($master.IncludedFO)</td></tr>
     <tr><th>Entity Counts Included</th><td>$($master.IncludedEntityCounts)</td></tr>
+    <tr><th>Maker Inventory Included</th><td>$($master.IncludedMakerInventory)</td></tr>
+    <tr><th>Governance (DLP) Included</th><td>$($master.IncludedGovernance)</td></tr>
+    <tr><th>RBAC Depth Included</th><td>$($master.IncludedRBAC)</td></tr>
+    <tr><th>Metadata Depth Included</th><td>$($master.IncludedMetadataDepth)</td></tr>
+    <tr><th>Activity Telemetry Included</th><td>$($master.IncludedActivity)</td></tr>
     <tr><th>Data Path</th><td>$DataPath</td></tr>
   </table>
 
@@ -1323,6 +1628,9 @@ $(
   `$('#activityTable').DataTable({ pageLength: 25, order: [[7,'desc']] });
   `$('#govTable').DataTable({ pageLength: 25, order: [[1,'asc']], columnDefs: [{ targets: 1, type: 'num' }] });
   `$('#foTable').DataTable({ pageLength: 25 });
+  if (`$('#makerTable').length) { `$('#makerTable').DataTable({ pageLength: 25 }); }
+  if (`$('#rbacTable').length)  { `$('#rbacTable').DataTable({ pageLength: 25 }); }
+  if (`$('#mdTable').length)    { `$('#mdTable').DataTable({ pageLength: 25 }); }
 });
 </script>
 </body>

@@ -12,3 +12,5 @@
 /credentials/*
 !/credentials/README.md
 !/credentials/.gitkeep
+/resources
+/testResults.xml

@@ -22,38 +22,39 @@ Describe 'PowerShell Script Syntax' {
             $scriptFiles.Count | Should -BeGreaterThan 0
         }
 
-        foreach ($file in @(
+        It 'has no parse errors: <_>' -ForEach @(
             'scripts\modules\PPACInventory.psm1'
             'scripts\Invoke-DataverseInventory.ps1'
             'scripts\Generate-Report.ps1'
             'scripts\collectors\Collect-CEData.ps1'
             'scripts\collectors\Collect-FOData.ps1'
             'scripts\collectors\Collect-EnvironmentList.ps1'
+            'scripts\collectors\Collect-MakerInventory.ps1'
+            'scripts\collectors\Collect-TenantGovernance.ps1'
+            'scripts\collectors\Collect-RBAC.ps1'
+            'scripts\collectors\Collect-MetadataDepth.ps1'
+            'scripts\collectors\Collect-Activity.ps1'
             'scripts\00_Prerequisites.ps1'
             'Start-Inventory.ps1'
-        )) {
-            It "has no parse errors: $file" {
-                $fullPath = Join-Path $repoRoot $file
-                Test-Path $fullPath | Should -BeTrue -Because "file should exist: $file"
+        ) {
+            $fullPath = Join-Path $repoRoot $_
+            Test-Path $fullPath | Should -BeTrue -Because "file should exist: $_"
 
-                $errors = $null
-                $null = [System.Management.Automation.Language.Parser]::ParseFile(
-                    $fullPath, [ref]$null, [ref]$errors
-                )
-                $errors | Should -BeNullOrEmpty -Because "parse errors in $file"
-            }
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                $fullPath, [ref]$null, [ref]$errors
+            )
+            $errors | Should -BeNullOrEmpty -Because "parse errors in $_"
         }
     }
 
     Context 'All discovered scripts parse cleanly' {
-        foreach ($file in $scriptFiles) {
-            It "parses without error: $($file.Name)" {
-                $errors = $null
-                $null = [System.Management.Automation.Language.Parser]::ParseFile(
-                    $file.FullName, [ref]$null, [ref]$errors
-                )
-                $errors | Should -BeNullOrEmpty -Because "parse error in $($file.FullName)"
-            }
+        It 'parses without error: <_.Name>' -ForEach $scriptFiles {
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                $_.FullName, [ref]$null, [ref]$errors
+            )
+            $errors | Should -BeNullOrEmpty -Because "parse error in $($_.FullName)"
         }
     }
 }
