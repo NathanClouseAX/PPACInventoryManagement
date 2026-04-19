@@ -65,6 +65,32 @@ function Write-InventoryLog {
 
 function Set-InventoryLogFile {
     param([string]$Path)
+
+    # Rotate when the existing log exceeds 50 MB. Keeps up to 5 historical copies
+    # ($Path.1 newest .. $Path.5 oldest); .5 is dropped on each rotation. Caps disk
+    # use at ~300 MB per log family (current + 5 rolls) so an unattended cron run
+    # over months doesn't fill the disk, while preserving enough recent history to
+    # diagnose a failure after the fact.
+    if ($Path -and (Test-Path -LiteralPath $Path)) {
+        try {
+            $sizeBytes = (Get-Item -LiteralPath $Path).Length
+            if ($sizeBytes -gt 50MB) {
+                for ($i = 4; $i -ge 1; $i--) {
+                    $src = "$Path.$i"
+                    $dst = "$Path.$($i + 1)"
+                    if (Test-Path -LiteralPath $src) {
+                        Move-Item -LiteralPath $src -Destination $dst -Force
+                    }
+                }
+                Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+            }
+        } catch {
+            # Rotation must never block logging — if Move-Item fails (e.g. another
+            # process holds the file open), continue with the existing log.
+            Write-Warning "Log rotation skipped for ${Path}: $($_.Exception.Message)"
+        }
+    }
+
     $script:LogFile = $Path
 }
 
@@ -101,7 +127,25 @@ function Get-AzureToken {
 
     Write-InventoryLog "Acquiring token for resource: $key" -Level DEBUG
 
-    $tokenResult = Get-AzAccessToken -ResourceUrl $key -ErrorAction Stop
+    # Retry token acquisition on transient failures (STS throttling, brief network
+    # hiccups, token-broker restart). Each attempt goes through Az.Accounts' MSAL
+    # cache so only the first real acquire costs; re-tries are almost free on hit.
+    $tokenResult = $null
+    $tokenAttempt = 0
+    $tokenMaxRetries = 3
+    while ($true) {
+        try {
+            $tokenResult = Get-AzAccessToken -ResourceUrl $key -ErrorAction Stop
+            break
+        } catch {
+            if ($tokenAttempt -ge $tokenMaxRetries) { throw }
+            $delay = [Math]::Pow(2, $tokenAttempt) * 2 + (Get-Random -Minimum 0 -Maximum 2)
+            Write-InventoryLog ("Token acquisition failed for {0} (attempt {1}/{2}): {3}. Retrying in {4}s..." -f `
+                $key, ($tokenAttempt + 1), $tokenMaxRetries, $_.Exception.Message, $delay) -Level WARN
+            Start-Sleep -Seconds $delay
+            $tokenAttempt++
+        }
+    }
 
     # Az.Accounts >= 2.17 returns SecureString by default; handle both
     $rawToken = $tokenResult.Token
@@ -171,8 +215,12 @@ function Invoke-RestWithRetry {
 
             if (-not $shouldRetry) { throw }
 
-            # Calculate delay: respect Retry-After header if present for 429
-            $delay = [Math]::Pow(2, $attempt) * 3   # 3, 6, 12, 24, 48 s
+            # Base delay is exponential (3, 6, 12, 24, 48s). Jitter 0-3s is added
+            # so parallel workers don't re-synchronize on the same backoff wave
+            # when a whole tenant hits 429 at once. If the server sent Retry-After
+            # we honor it exactly (plus 1s guard) - no jitter in that case, since
+            # the server already told us when to come back.
+            $delay = [Math]::Pow(2, $attempt) * 3
             if ($statusCode -eq 429) {
                 try {
                     $ra = $_.Exception.Response.Headers['Retry-After']
@@ -180,6 +228,7 @@ function Invoke-RestWithRetry {
                 } catch {}
                 Write-InventoryLog "Rate limited (429). Waiting ${delay}s (attempt $($attempt+1)/$MaxRetries)..." -Level WARN
             } else {
+                $delay += Get-Random -Minimum 0 -Maximum 3
                 Write-InventoryLog "HTTP $statusCode on attempt $($attempt+1). Retrying in ${delay}s..." -Level WARN
             }
 
@@ -541,7 +590,15 @@ function Save-EnvironmentData {
     # Use -InputObject instead of piping. Piping enumerates arrays and PS 5.1's
     # ConvertTo-Json then wraps multi-element pipeline input as {value:[...],Count:N}
     # rather than a bare JSON array, which breaks any reader expecting an array.
-    ConvertTo-Json -InputObject $Data -Depth 15 -Compress:$false | Set-Content -Path $outPath -Encoding UTF8 -Force
+    try {
+        ConvertTo-Json -InputObject $Data -Depth 15 -Compress:$false | Set-Content -Path $outPath -Encoding UTF8 -Force
+    } catch {
+        # Re-throw with path + exception type so the per-collector try/catch in
+        # Collect-OneEnvironment.ps1 records actionable context (disk full vs
+        # locked file vs permission denied) instead of a bare 'Set-Content failed'.
+        $exType = $_.Exception.GetType().FullName
+        throw "Save-EnvironmentData failed writing '$outPath' [$exType]: $($_.Exception.Message)"
+    }
     Write-InventoryLog "  Saved: $outPath" -Level DEBUG
 }
 
@@ -559,7 +616,12 @@ function Save-RootData {
     }
     $outPath = Join-Path $script:OutputPath $FileName
     # See Save-EnvironmentData for why -InputObject (not pipe) is required here.
-    ConvertTo-Json -InputObject $Data -Depth 15 | Set-Content -Path $outPath -Encoding UTF8 -Force
+    try {
+        ConvertTo-Json -InputObject $Data -Depth 15 | Set-Content -Path $outPath -Encoding UTF8 -Force
+    } catch {
+        $exType = $_.Exception.GetType().FullName
+        throw "Save-RootData failed writing '$outPath' [$exType]: $($_.Exception.Message)"
+    }
     Write-InventoryLog "Saved: $outPath" -Level DEBUG
 }
 

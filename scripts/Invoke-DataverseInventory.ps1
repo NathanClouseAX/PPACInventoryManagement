@@ -346,32 +346,44 @@ if ($MaxDegreeOfParallelism -le 1) {
     $envIdx  = 0
     foreach ($env in $environments) {
         $envIdx++
-        $ps = [powershell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddCommand($workerScript)
-        [void]$ps.AddParameters(@{
-            EnvEntry              = $env
-            OutputPath            = $OutputPath
-            ScriptDir             = $ScriptDir
-            EnvIndex              = $envIdx
-            TotalEnvironments     = $environments.Count
-            IncludeEntityCounts   = $IncludeEntityCounts.IsPresent
-            EntityCountTop        = $EntityCountTop
-            IncludeFO             = $IncludeFO.IsPresent
-            IncludeMakerInventory = $IncludeMakerInventory.IsPresent
-            IncludeGovernance     = $IncludeGovernance.IsPresent
-            IncludeRBAC           = $IncludeRBAC.IsPresent
-            IncludeMetadataDepth  = $IncludeMetadataDepth.IsPresent
-            IncludeActivity       = $IncludeActivity.IsPresent
-            Force                 = $Force.IsPresent
-        })
-        $pending.Add([PSCustomObject]@{
-            PowerShell  = $ps
-            AsyncResult = $ps.BeginInvoke()
-            EnvIndex    = $envIdx
-            EnvName     = $env.DisplayName
-            EnvSku      = $env.EnvironmentSku
-        })
+        # Guard every step that can throw under memory pressure or when the
+        # runspace pool is in a bad state. If Create/AddCommand/BeginInvoke fails
+        # for one env, dispose what we've built for that one and keep dispatching
+        # the others - a single bad env should not abort the whole parallel run.
+        $ps = $null
+        try {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddCommand($workerScript)
+            [void]$ps.AddParameters(@{
+                EnvEntry              = $env
+                OutputPath            = $OutputPath
+                ScriptDir             = $ScriptDir
+                EnvIndex              = $envIdx
+                TotalEnvironments     = $environments.Count
+                IncludeEntityCounts   = $IncludeEntityCounts.IsPresent
+                EntityCountTop        = $EntityCountTop
+                IncludeFO             = $IncludeFO.IsPresent
+                IncludeMakerInventory = $IncludeMakerInventory.IsPresent
+                IncludeGovernance     = $IncludeGovernance.IsPresent
+                IncludeRBAC           = $IncludeRBAC.IsPresent
+                IncludeMetadataDepth  = $IncludeMetadataDepth.IsPresent
+                IncludeActivity       = $IncludeActivity.IsPresent
+                Force                 = $Force.IsPresent
+            })
+            $async = $ps.BeginInvoke()
+            $pending.Add([PSCustomObject]@{
+                PowerShell  = $ps
+                AsyncResult = $async
+                EnvIndex    = $envIdx
+                EnvName     = $env.DisplayName
+                EnvSku      = $env.EnvironmentSku
+            })
+        } catch {
+            Write-InventoryLog "  [$($env.DisplayName)] failed to dispatch worker: $_" -Level ERROR -Indent 1
+            $errorCount++
+            if ($ps) { try { $ps.Dispose() } catch {} }
+        }
     }
 
     Write-InventoryLog "Queued $($pending.Count) environment workers. Waiting for completion..." -Indent 1
