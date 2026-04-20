@@ -202,8 +202,9 @@ $issueCategories = [ordered]@{
     'Env Vars Missing Values'  = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'ENV_VARS_MISSING_VALUES' } })
     'No Managed Solutions'     = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'NO_MANAGED_SOLUTIONS' } })
     'Trials Expiring (>20d)'   = @($envDetails | Where-Object {
-        $_.Sku -eq 'Trial' -and $_.CreatedTime -and
-        (try { (New-TimeSpan -Start ([datetime]$_.CreatedTime) -End (Get-Date)).TotalDays -gt 20 } catch { $false })
+        if ($_.Sku -ne 'Trial' -or -not $_.CreatedTime) { return $false }
+        $dt = [datetime]::MinValue
+        [datetime]::TryParse($_.CreatedTime, [ref]$dt) -and (New-TimeSpan -Start $dt -End (Get-Date)).TotalDays -gt 20
     })
     'Mailbox Sync Errors'      = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'MAILBOX_SYNC_ERRORS' } })
     'Unresolved Duplicates'    = @($envDetails | Where-Object { $_.AllFlags | Where-Object { $_ -match 'HIGH_UNRESOLVED_DUPLICATES|MANY_UNRESOLVED_DUPLICATES' } })
