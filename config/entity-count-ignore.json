@@ -1,0 +1,5 @@
+{
+  "_comment": "Logical names (Dataverse) and entity names (F&O) to exclude from the Top 25 Tables by Record Count section of the report. Matching is case-insensitive against the LogicalName field. Use this to filter out system/infrastructure tables that inflate counts and obscure meaningful business data.",
+  "Entities": [
+  ]
+}

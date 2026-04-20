@@ -279,6 +279,21 @@ if (Test-Path $ownersFile) {
     } catch {}
 }
 
+# Entity count ignore list
+$entityCountIgnore = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$entityIgnoreFile = Join-Path $configDir 'entity-count-ignore.json'
+if (Test-Path $entityIgnoreFile) {
+    try {
+        $eiRaw = Get-Content $entityIgnoreFile -Raw | ConvertFrom-Json
+        foreach ($entry in $eiRaw.Entities) {
+            if ($entry.Name) { $null = $entityCountIgnore.Add($entry.Name) }
+        }
+        Write-Host "  Loaded entity count ignore list: $($entityCountIgnore.Count) entries" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  Warning: Could not parse entity-count-ignore.json" -ForegroundColor Yellow
+    }
+}
+
 # ── Governance score computation ─────────────────────────────────────────────
 function Get-FlagSeverity {
     param([string]$Flag)
@@ -548,12 +563,15 @@ function Build-StorageTable {
         $val = $e.$SortField
         $fmtVal = Format-MB $val
         $nameEsc = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+        $productTags = ''
+        if ($e.HasDataverse) { $productTags += '<span class="badge bg-info text-dark" style="font-size:0.7em">CE</span> ' }
+        if ($e.HasFO)        { $productTags += '<span class="badge text-white" style="background:#6f42c1;font-size:0.7em">FO</span> ' }
         $bar = [Math]::Min(100, [Math]::Round($val / ([Math]::Max(1,($Envs | Measure-Object $SortField -Max).Maximum)) * 100, 0))
         $barColor = if ($bar -gt 80) {'bg-danger'} elseif ($bar -gt 50) {'bg-warning'} else {'bg-info'}
         $null = $sb.Append(@"
 <tr>
   <td>$rank</td>
-  <td>$nameEsc<br><small class='text-muted'>$($e.Sku) | $($e.Location)</small></td>
+  <td>$nameEsc $productTags<br><small class='text-muted'>$($e.Sku) | $($e.Location)</small></td>
   <td>$fmtVal</td>
   <td><div class='progress' style='min-width:100px'><div class='progress-bar $barColor' role='progressbar' style='width:${bar}%'>$bar%</div></div></td>
 </tr>
@@ -703,6 +721,9 @@ foreach ($envEntry in $master.Environments) {
     $countsArr = @()
     if ($ceCounts.Count -gt 0) { $countsArr += $ceCounts }
     if ($foCounts.Count -gt 0) { $countsArr += $foCounts }
+    if ($entityCountIgnore.Count -gt 0) {
+        $countsArr = @($countsArr | Where-Object { -not $entityCountIgnore.Contains([string]$_.LogicalName) })
+    }
     if ($countsArr.Count -eq 0) { continue }
 
     $top25       = @($countsArr | Sort-Object -Property RecordCount -Descending | Select-Object -First 25)
@@ -713,6 +734,8 @@ foreach ($envEntry in $master.Environments) {
         EnvironmentId = $envEntry.EnvironmentId
         DisplayName   = $envEntry.DisplayName
         Sku           = $envEntry.EnvironmentSku
+        HasFO         = $envEntry.HasFO
+        HasDataverse  = $envEntry.HasDataverse
         Top25         = $top25
         TotalTop25    = [int64]($totalTop25 | ForEach-Object { if ($null -eq $_) { 0 } else { $_ } })
         TotalAll      = [int64]($totalAll   | ForEach-Object { if ($null -eq $_) { 0 } else { $_ } })
@@ -731,6 +754,9 @@ foreach ($envInfo in $envsWithCountsSorted) {
     $top25Fmt   = '{0:N0}' -f $envInfo.TotalTop25
     $tableCount = $envInfo.CountedTables
 
+    $productTags = ''
+    if ($envInfo.HasDataverse) { $productTags += '<span class="badge bg-info text-dark" style="font-size:0.75em">CE</span> ' }
+    if ($envInfo.HasFO)        { $productTags += '<span class="badge text-white" style="background:#6f42c1;font-size:0.75em">FO</span> ' }
     $rows = ''
     $rank = 0
     foreach ($t in $envInfo.Top25) {
@@ -755,7 +781,7 @@ foreach ($envInfo in $envsWithCountsSorted) {
 <div class='card mb-2'>
   <div class='card-header bg-light p-2'>
     <button class='btn btn-link text-decoration-none p-0 fw-bold text-start' data-bs-toggle='collapse' data-bs-target='#tt_$envIdSafe'>
-      $nameEsc <small class='text-muted fw-normal'>($skuEsc) &mdash; $tableCount tables counted, $totalFmt total records (top-25: $top25Fmt)</small>
+      $nameEsc $productTags<small class='text-muted fw-normal'>($skuEsc) &mdash; $tableCount tables counted, $totalFmt total records (top-25: $top25Fmt)</small>
     </button>
   </div>
   <div id='tt_$envIdSafe' class='collapse'>
@@ -790,10 +816,12 @@ $cleanupRecCount    = 0
 foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
     if (-not $e.CE -or -not $e.CE.Sections) { continue }
     $sections = $e.CE.Sections
-    $cth      = $sections.CleanupTableHealth
-    $asyncCnt = if ($sections.AsyncOperations) { $sections.AsyncOperations.Counts } else { $null }
-    $orgSet   = $sections.OrgSettings
-    $nameEsc  = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
+    $cth        = $sections.CleanupTableHealth
+    $asyncCnt   = if ($sections.AsyncOperations) { $sections.AsyncOperations.Counts } else { $null }
+    $orgSet     = $sections.OrgSettings
+    $bulkDelSec = $sections.BulkDeleteJobs
+    $staleProc  = $sections.StaleProcessInstances
+    $nameEsc    = [System.Web.HttpUtility]::HtmlEncode($e.DisplayName)
 
     $recs = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -803,13 +831,28 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
         if ($cnt -gt 0) {
             $prio = if ($cnt -gt 100000) { 'High' } elseif ($cnt -gt 10000) { 'Medium' } else { $null }
             if ($prio) {
+                $coverNote = if ($bulkDelSec -and -not $bulkDelSec.CoversAsyncOps) { ' <strong>No matching bulk delete job detected &mdash; create one now.</strong>' } else { '' }
                 $recs.Add([PSCustomObject]@{
                     Priority = $prio; StorageType = 'DB + Log'
                     DataType = 'Completed Async Operations (&gt;90d)'
                     Count    = $cnt
-                    Action   = 'Bulk Delete Job: <em>System Jobs</em> &rarr; Status Reason = Succeeded/Canceled/Failed AND Created On &lt; 90 days ago'
+                    Action   = "Affects AsyncOperationBase and WorkflowLogBase (typically the largest DB storage category). Create or verify a recurring Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>System Jobs</em>, filter Status Reason = Succeeded AND Canceled AND Failed, Created On older than 90 days. Schedule weekly outside business hours.$coverNote"
                 })
             }
+        }
+    }
+
+    # High failed async jobs in last 30 days — systemic breakage, accumulates in AsyncOperationBase
+    if ($asyncCnt -and $asyncCnt.Failed_Last30d -gt 0) {
+        $cnt = [int]$asyncCnt.Failed_Last30d
+        $prio = if ($cnt -gt 5000) { 'High' } elseif ($cnt -gt 1000) { 'Medium' } elseif ($cnt -gt 200) { 'Low' } else { $null }
+        if ($prio) {
+            $recs.Add([PSCustomObject]@{
+                Priority = $prio; StorageType = 'DB'
+                DataType = "Failed System Jobs &mdash; Last 30d ($cnt)"
+                Count    = $cnt
+                Action   = 'Failed jobs accumulate in AsyncOperationBase. Investigate root cause: <strong>Settings &rarr; System &rarr; System Jobs</strong> (filter Status = Failed). Identify and fix broken plugins or flows. Then add a Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>System Jobs</em>, Status Reason = Failed AND Created On older than 30 days.'
+            })
         }
     }
 
@@ -820,7 +863,7 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
             Priority = 'High'; StorageType = 'DB'
             DataType = 'Suspended System Jobs'
             Count    = $cnt
-            Action   = 'Investigate root cause (broken plugin/flow), then Bulk Delete Job: <em>System Jobs</em> &rarr; Status = Suspended AND Created On &lt; 30 days ago'
+            Action   = 'Investigate root cause first (broken plugin or infinite-loop workflow): <strong>Settings &rarr; System &rarr; System Jobs</strong> (filter Status = Suspended). Review job descriptions to identify the offending customization. After resolving, delete via Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>System Jobs</em>, Status = Suspended AND Created On older than 30 days.'
         })
     }
 
@@ -833,7 +876,7 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
                 Priority = $prio; StorageType = 'DB'
                 DataType = 'Old Succeeded Workflow Logs (&gt;30d)'
                 Count    = $cnt
-                Action   = 'Bulk Delete Job: <em>System Jobs</em> &rarr; Status = Succeeded AND Created On &lt; 30 days ago (WorkflowLog cascade-deletes with parent AsyncOperation)'
+                Action   = 'WorkflowLog (WorkflowLogBase) records accumulate when the async operation cleanup job is not running. These cascade-delete automatically when their parent System Job is deleted. Ensure a recurring Bulk Delete job is targeting <em>System Jobs</em> (Status = Succeeded AND Created On &lt; 30 days ago): <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion</strong>.'
             })
         }
     }
@@ -845,15 +888,14 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
             Priority = 'High'; StorageType = 'Log'
             DataType = "Plugin Trace Logging ON ($($orgSet.PluginTraceLogSetting))"
             Count    = $traceCount
-            Action   = 'Disable: Settings &rarr; Administration &rarr; System Settings &rarr; Customization &rarr; Enable logging to plug-in trace log = <strong>Off</strong>. Built-in job auto-clears old records once disabled.'
+            Action   = 'Disable immediately: <strong>Settings &rarr; Administration &rarr; System Settings &rarr; Customization tab &rarr; Enable logging to plug-in trace log = Off</strong>. The built-in daily cleanup job removes records &gt;1 day old once disabled. To delete existing records now: <strong>Advanced Settings &rarr; Customizations &rarr; Plug-In Trace Log &rarr; Select All &rarr; Delete</strong>. Never leave enabled in production &mdash; fills Log storage rapidly.'
         })
     } elseif ($cth -and $cth.PluginTraceLogTotal -gt 5000) {
-        # Trace logging appears Off but logs are still accumulating — verify the built-in cleanup job is running
         $recs.Add([PSCustomObject]@{
             Priority = 'Medium'; StorageType = 'Log'
             DataType = 'Plugin Trace Logs Accumulating'
             Count    = [int]$cth.PluginTraceLogTotal
-            Action   = 'Verify trace logging is Off. If already Off, the built-in daily cleanup job should clear these within 24h — check that job is not suspended.'
+            Action   = 'Trace logging appears Off but records remain. The built-in daily cleanup job should clear these within 24h &mdash; verify it is not suspended: <strong>Settings &rarr; System &rarr; System Jobs</strong> (search for &ldquo;Plug-In Trace Log&rdquo;). To delete manually: <strong>Advanced Settings &rarr; Customizations &rarr; Plug-In Trace Log &rarr; Select All &rarr; Delete</strong>.'
         })
     }
 
@@ -866,7 +908,7 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
                 Priority = $prio; StorageType = 'File'
                 DataType = 'Large Attachment Notes (&gt;1 MB)'
                 Count    = $cnt
-                Action   = 'Bulk Delete Job: <em>Notes</em> &rarr; File Size (Bytes) &gt; 1048576 AND Created On &lt; [your retention date]. Review which tables generate these before deleting.'
+                Action   = 'Affects AnnotationBase and associated file storage. Review which record types generate large attachments (emails, document uploads). Create a recurring Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>Notes</em>, filter File Size (Bytes) &gt; 1048576 AND Created On older than [your retention date]. Note: file deletion is permanent in the application.'
             })
         }
     }
@@ -876,11 +918,12 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
         $cnt = [int]$cth.OldCompletedEmails
         $prio = if ($cnt -gt 10000) { 'High' } elseif ($cnt -gt 2000) { 'Medium' } else { $null }
         if ($prio) {
+            $coverNote = if ($bulkDelSec -and -not $bulkDelSec.CoversEmail) { ' <strong>No email bulk delete job detected &mdash; create one now.</strong>' } else { '' }
             $recs.Add([PSCustomObject]@{
                 Priority = $prio; StorageType = 'DB'
                 DataType = 'Old Completed Email Activities (&gt;90d)'
                 Count    = $cnt
-                Action   = 'Bulk Delete Job: <em>Email Messages</em> &rarr; Status = Completed AND Actual End &lt; 90 days ago. Exclude emails linked to open cases or important records.'
+                Action   = "Affects EmailBase, EmailHashBase, ActivityPartyBase, and ActivityPointerBase. Create a recurring Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>Email Messages</em>, filter Status = Completed AND Actual End older than 90 days. Schedule outside business hours. Caution: this removes email history &mdash; confirm with business owners and exclude emails linked to open cases if required.$coverNote"
             })
         }
     }
@@ -891,7 +934,7 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
             Priority = 'Low'; StorageType = 'DB'
             DataType = 'Old Import Job History (&gt;90d)'
             Count    = [int]$cth.OldImportJobRecords
-            Action   = 'Bulk Delete Job: <em>System Jobs</em> &rarr; System Job Type = Import AND Created On &lt; 90 days ago'
+            Action   = 'ImportJobBase accumulates history from all data imports. Caution: deleting these records removes rollback capability for those imports. Create a Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>System Jobs</em>, System Job Type = Import AND Created On older than 90 days.'
         })
     }
 
@@ -901,18 +944,134 @@ foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
             Priority = 'Low'; StorageType = 'DB'
             DataType = 'Old Bulk Delete Operation History (&gt;90d)'
             Count    = [int]$cth.OldBulkDeleteOpRecords
-            Action   = 'Self-cleaning Bulk Delete Job: <em>System Jobs</em> &rarr; System Job Type = Bulk Delete AND Status = Succeeded AND Created On &lt; 90 days ago'
+            Action   = 'Create a self-cleaning Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>System Jobs</em>, System Job Type = Bulk Delete AND Status = Succeeded AND Created On older than 90 days. Schedule weekly outside business hours.'
         })
+    }
+
+    # Stale BPF / process session instances (Active but >180 days old, likely abandoned)
+    if ($staleProc -and $null -ne $staleProc.StaleActiveCount -and $staleProc.StaleActiveCount -gt 0) {
+        $cnt = [int]$staleProc.StaleActiveCount
+        $prio = if ($cnt -gt 5000) { 'High' } elseif ($cnt -gt 500) { 'Medium' } else { $null }
+        if ($prio) {
+            $recs.Add([PSCustomObject]@{
+                Priority = $prio; StorageType = 'DB'
+                DataType = 'Stale BPF / Process Session Instances (&gt;180d Active)'
+                Count    = $cnt
+                Action   = 'Active Business Process Flow instances older than 180 days are likely abandoned and inflate ProcessSessionBase. Review: <strong>Settings &rarr; Advanced Find &rarr; Look for = Process Sessions</strong>, filter Status = Active AND Created On older than 180 days. Deactivate or delete abandoned BPF instances. Consider a recurring Bulk Delete job: <strong>Settings &rarr; Data Management &rarr; Bulk Record Deletion &rarr; New</strong> &rarr; Entity = <em>Process Sessions</em>, Status = Inactive AND Modified On older than [retention date].'
+            })
+        }
     }
 
     # Audit retention set to Forever — AuditBase will grow without bound
     if ($orgSet -and $orgSet.AuditEnabled -and $orgSet.AuditRetentionDays -eq -1) {
+        $auditCoverNote = if ($bulkDelSec -and -not $bulkDelSec.CoversAudit) { ' <strong>No audit bulk delete job detected.</strong>' } else { '' }
         $recs.Add([PSCustomObject]@{
             Priority = 'High'; StorageType = 'DB'
             DataType = 'Audit Retention = Forever (no auto-delete)'
             Count    = 'N/A'
-            Action   = 'Settings &rarr; Auditing &rarr; Global Audit Settings &rarr; Set Retention Period (e.g., 365 days). Without a limit, AuditBase grows indefinitely.'
+            Action   = "AuditBase grows indefinitely without a retention limit. (1) Set a retention period: <strong>Settings &rarr; Auditing &rarr; Global Audit Settings &rarr; Retention Period</strong> (e.g., 365 days). (2) Delete existing old logs now: <strong>Power Platform Admin Center &rarr; Environments &rarr; [this environment] &rarr; Settings &rarr; Audit and logs &rarr; Delete logs</strong> &mdash; delete by table or delete all access logs up to a chosen date. Note: audit log deletion prevents historical activity review.$auditCoverNote"
         })
+    }
+
+    # Duplicate detection job history — each job run stores a copy of every detected duplicate pair in DuplicateRecordBase
+    $dupDetect = $sections.DuplicateDetection
+    $dupRecs   = $sections.DuplicateRecords
+    if ($dupDetect -and $dupDetect.EnabledCount -gt 0 -and $dupRecs -and $dupRecs.UnresolvedCount -gt 100) {
+        $cnt = [int]$dupRecs.UnresolvedCount
+        $prio = if ($cnt -gt 5000) { 'Medium' } else { 'Low' }
+        $recs.Add([PSCustomObject]@{
+            Priority = $prio; StorageType = 'DB'
+            DataType = "Duplicate Detection Job History ($cnt unresolved pairs)"
+            Count    = $cnt
+            Action   = 'Each duplicate detection job run stores a copy of every detected duplicate in DuplicateRecordBase. Delete old job instances to reclaim space: <strong>Settings &rarr; Data Management &rarr; Duplicate Detection Jobs</strong> &rarr; select completed job instances &rarr; Delete. To avoid re-accumulation, resolve duplicate records promptly so they are not reported in multiple subsequent job runs.'
+        })
+    }
+
+    # Server-Side Sync alert trace logs — mailbox errors generate TraceLogBase entries rapidly
+    $mailboxSec = $sections.MailboxHealth
+    if ($mailboxSec -and $mailboxSec.InError -gt 0) {
+        $prio = if ($mailboxSec.InError -gt 10) { 'Medium' } else { 'Low' }
+        $recs.Add([PSCustomObject]@{
+            Priority = $prio; StorageType = 'DB'
+            DataType = "SSS Alert Trace Logs ($($mailboxSec.InError) mailbox(es) in error)"
+            Count    = $mailboxSec.InError
+            Action   = 'Server-Side Synchronization errors generate TraceLogBase (Alert) records that accumulate silently. Delete stale alerts: open a <strong>Mailbox</strong> or <strong>Email Server Profile</strong> record in Advanced Settings &rarr; Email Configuration, go to the <strong>Alerts</strong> tab &rarr; Select All &rarr; Delete. Alternatively use Advanced Find or a Bulk Delete job targeting <em>Trace Records</em>. Fix the underlying mailbox errors first to stop new alerts: <strong>Settings &rarr; Email Configuration &rarr; Mailboxes</strong>.'
+        })
+    }
+
+    # ExchangeSyncIdMapping — item-level monitoring rows accumulate for every SSS-tracked item
+    if ($mailboxSec -and $mailboxSec.TotalActive -gt 50) {
+        $recs.Add([PSCustomObject]@{
+            Priority = 'Low'; StorageType = 'DB'
+            DataType = "ExchangeSyncIdMapping Accumulation ($($mailboxSec.TotalActive) active mailboxes)"
+            Count    = $mailboxSec.TotalActive
+            Action   = 'Server-Side Sync writes item-level monitoring rows to ExchangeSyncIdMappingBase for each tracked email, appointment, contact, and task. The default troubleshooting-record retention is 3 days. To reduce retention or disable item-level monitoring: <strong>Settings &rarr; Administration &rarr; System Settings &rarr; Email tab &rarr; Monitor email processing errors after = [reduce days] or select None</strong>. See: <em>Troubleshoot item level Server-Side Synchronization issues</em> on Microsoft Docs.'
+        })
+    }
+
+    # ── F&O-specific cleanup recommendations ─────────────────────────────────
+    if ($e.HasFO -and $e.FO -and $e.FO.Sections) {
+        $foRecSec = $e.FO.Sections
+        $criticalFOCategories = @('System', 'DIXF')
+
+        # Batch jobs in error — may be blocking scheduled processing and accumulating history
+        if ($foRecSec.BatchJobs -and $null -ne $foRecSec.BatchJobs.ErrorCount) {
+            $foErrCnt = [int]$foRecSec.BatchJobs.ErrorCount
+            if ($foErrCnt -gt 0) {
+                $foPrio = if ($foErrCnt -gt 50) { 'High' } elseif ($foErrCnt -gt 10) { 'Medium' } else { 'Low' }
+                $foTotalCnt = if ($null -ne $foRecSec.BatchJobs.TotalCount) { [int]$foRecSec.BatchJobs.TotalCount } else { '?' }
+                $recs.Add([PSCustomObject]@{
+                    Priority = $foPrio; StorageType = 'DB'
+                    DataType = "F&amp;O: Batch Jobs in Error ($foErrCnt of $foTotalCnt)"
+                    Count    = $foErrCnt
+                    Action   = 'Review: <strong>System administration &rarr; Inquiries &rarr; Batch jobs</strong> (filter Status = Error). Fix root cause, then purge history: <strong>System administration &rarr; Periodic tasks &rarr; Batch job history clean-up</strong> &mdash; recommended 180-day retention, run daily outside business hours. Cleans BatchJobHistory, BatchHistory, and BatchConstraintHistory tables.'
+                })
+            }
+        }
+
+        if ($foRecSec.FOCleanupJobs) {
+            $foCleanup = $foRecSec.FOCleanupJobs
+
+            # Missing standard cleanup jobs — each is a specific batch job that should be scheduled
+            foreach ($mj in @($foCleanup.MissingStandardJobs)) {
+                if (-not $mj -or -not $mj.Purpose) { continue }
+                $mjCat     = [string]$mj.Category
+                $mjPurpose = [System.Web.HttpUtility]::HtmlEncode([string]$mj.Purpose)
+                $mjMenu    = [System.Web.HttpUtility]::HtmlEncode([string]$mj.MenuPath)
+                $mjNotes   = if ($mj.Notes) { ' <em>' + [System.Web.HttpUtility]::HtmlEncode([string]$mj.Notes) + '</em>' } else { '' }
+                $mjPrio    = if ($criticalFOCategories -contains $mjCat) { 'High' } else { 'Medium' }
+                $recs.Add([PSCustomObject]@{
+                    Priority = $mjPrio; StorageType = 'DB'
+                    DataType = "F&amp;O Missing Cleanup Job &ndash; $mjPurpose"
+                    Count    = 'Not scheduled'
+                    Action   = "Navigate to <strong>$mjMenu</strong> and schedule a recurring batch job.$mjNotes"
+                })
+            }
+
+            # Found cleanup jobs that are disabled (Withheld/Canceled, no enabled instances)
+            foreach ($dj in @($foCleanup.FoundStandardJobs)) {
+                if (-not $dj -or $dj.IsEnabled -ne $false) { continue }
+                $djCat     = [string]$dj.Category
+                $djPurpose = [System.Web.HttpUtility]::HtmlEncode([string]$dj.Purpose)
+                $djMenu    = [System.Web.HttpUtility]::HtmlEncode([string]$dj.MenuPath)
+                $djNotes   = if ($dj.Notes) { ' <em>' + [System.Web.HttpUtility]::HtmlEncode([string]$dj.Notes) + '</em>' } else { '' }
+                $djPrio    = if ($criticalFOCategories -contains $djCat) { 'High' } else { 'Medium' }
+                $djIsError = ($null -ne $dj.ErrorCount -and [int]$dj.ErrorCount -gt 0)
+                if ($djIsError) {
+                    $djStatus = 'in Error'
+                    $djAction = "Cleanup job is <strong>in error state</strong> &mdash; investigate then reset at: <strong>$djMenu</strong>.$djNotes"
+                } else {
+                    $djStatus = 'Disabled'
+                    $djAction = "Cleanup job exists but is <strong>disabled (Withheld/Canceled)</strong> &mdash; re-enable and reschedule at: <strong>$djMenu</strong>.$djNotes"
+                }
+                $recs.Add([PSCustomObject]@{
+                    Priority = $djPrio; StorageType = 'DB'
+                    DataType = "F&amp;O Cleanup Job $djStatus &ndash; $djPurpose"
+                    Count    = $djStatus
+                    Action   = $djAction
+                })
+            }
+        }
     }
 
     if ($recs.Count -eq 0) { continue }
