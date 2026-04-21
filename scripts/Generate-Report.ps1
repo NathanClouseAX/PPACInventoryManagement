@@ -376,7 +376,7 @@ Write-Host "  Tenant governance score: $tenantScore / 100 ($criticalEnvs critica
 # Flags are compared by name prefix only — the parenthetical detail suffix is stripped —
 # so "HIGH_FAILED_JOBS_30D (12 jobs)" and "HIGH_FAILED_JOBS_30D (8 jobs)" are treated
 # as the same issue rather than generating a resolved+new pair on every count change.
-# Storage differences ≥ 10 MB are surfaced as growth events.
+# Storage differences ≥ 10 MB are surfaced (growth and reduction both).
 $deltaHtml = ''
 $runHistoryDir = Join-Path $DataPath 'run-history'
 if (Test-Path $runHistoryDir) {
@@ -440,12 +440,21 @@ if (Test-Path $runHistoryDir) {
                 }
             }
 
+            # Show top 15 growth and top 15 reductions separately so reductions
+            # aren't crowded out when many environments grew.
             $storageGrowthRows = ''
-            foreach ($sg in ($storageGrowth | Sort-Object Growth -Descending | Select-Object -First 15)) {
+            foreach ($sg in ($storageGrowth | Where-Object { $_.Growth -gt 0 } | Sort-Object Growth -Descending | Select-Object -First 15)) {
                 $nameEsc = [System.Web.HttpUtility]::HtmlEncode($sg.DisplayName)
-                $growthFmt = if ($sg.Growth -gt 0) { "+$(Format-MB $sg.Growth)" } else { Format-MB $sg.Growth }
-                $growthClass = if ($sg.Growth -gt 500) {'text-danger fw-bold'} elseif ($sg.Growth -gt 0) {'text-warning'} else {'text-success'}
+                $growthFmt = "+$(Format-MB $sg.Growth)"
+                $growthClass = if ($sg.Growth -gt 500) {'text-danger fw-bold'} else {'text-warning'}
                 $storageGrowthRows += "<tr><td>$nameEsc</td><td>$($sg.Sku)</td><td>$(Format-MB $sg.Previous)</td><td>$(Format-MB $sg.Current)</td><td class='$growthClass'>$growthFmt</td></tr>"
+            }
+
+            $storageReductionRows = ''
+            foreach ($sr in ($storageGrowth | Where-Object { $_.Growth -lt 0 } | Sort-Object Growth | Select-Object -First 15)) {
+                $nameEsc = [System.Web.HttpUtility]::HtmlEncode($sr.DisplayName)
+                $reductionFmt = Format-MB $sr.Growth
+                $storageReductionRows += "<tr><td>$nameEsc</td><td>$($sr.Sku)</td><td>$(Format-MB $sr.Previous)</td><td>$(Format-MB $sr.Current)</td><td class='text-success fw-bold'>$reductionFmt</td></tr>"
             }
 
             $deltaHtml = @"
@@ -467,6 +476,15 @@ if (Test-Path $runHistoryDir) {
   <table class="table table-sm table-bordered" style="max-width:800px">
     <thead class="table-secondary"><tr><th>Environment</th><th>SKU</th><th>Previous</th><th>Current</th><th>Growth</th></tr></thead>
     <tbody>$storageGrowthRows</tbody>
+  </table>
+"@
+  } else { '' })
+  $(if ($storageReductionRows) {
+    @"
+  <h6 class="mt-3">Storage Reductions (Top 15)</h6>
+  <table class="table table-sm table-bordered" style="max-width:800px">
+    <thead class="table-secondary"><tr><th>Environment</th><th>SKU</th><th>Previous</th><th>Current</th><th>Reduction</th></tr></thead>
+    <tbody>$storageReductionRows</tbody>
   </table>
 "@
   } else { '' })

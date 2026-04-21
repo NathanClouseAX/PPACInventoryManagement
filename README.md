@@ -277,7 +277,7 @@ The report includes a **Changes Since Last Run** section that compares the curre
 - `Invoke-DataverseInventory.ps1` saves a timestamped snapshot to `data/run-history/` at the end of every run.
 - `Generate-Report.ps1` loads the second-to-last snapshot and diffs it against the current data.
 - **Flags are compared by name prefix**, stripping the parenthetical detail suffix (e.g., `HIGH_FAILED_JOBS_30D (12 jobs)` and `HIGH_FAILED_JOBS_30D (8 jobs)` are the same issue — not resolved+new).
-- Storage differences ≥ 10 MB between runs are reported as growth events.
+- Storage differences ≥ 10 MB between runs are surfaced — growth and reductions are shown in separate top-15 tables.
 
 The delta section is omitted if fewer than two snapshots exist (first run).
 
@@ -380,7 +380,7 @@ Maps environment IDs to owner information. Populated automatically from Environm
 |---|---|
 | Executive Summary | Total environments, storage totals, tenant governance score, critical/healthy environment counts |
 | Issue Overview | Count cards for each issue category across the tenant |
-| Changes (Delta) | New flags, resolved flags, and storage growth vs. previous run |
+| Changes (Delta) | New flags, resolved flags, and storage growth/reductions vs. previous run |
 | Governance Scores | Per-environment score table with Critical/High/Medium/Low flag counts and owners |
 | Tenant Governance & DLP | Tenant-level DLP policy list, tenant isolation state, Managed Env digest/solution-checker coverage across environments |
 | All Environments | Full sortable/filterable table of all environments with flags, storage, and scores |
