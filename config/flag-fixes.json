@@ -1,0 +1,263 @@
+{
+  "_comment": "Inline fix snippets per flag. Rendered in the Priority Action Plan section alongside each flagged issue. Tokens {ENV_ID}, {ENV_NAME}, {ORG_URL}, {ORG_HOST}, {TENANT_ID} are substituted per-environment at render time. Edit/extend to match your organization's preferred remediation procedures.",
+  "Fixes": {
+    "NO_SCHEDULED_BULK_DELETE": {
+      "Why": "AsyncOperationBase grows indefinitely without a recurring Bulk Delete job — the #1 source of DB bloat in Dataverse.",
+      "Fix": "Create a recurring Bulk Delete Job. Entity = System Jobs; Status Reason in (Succeeded, Canceled, Failed); Created On older than 90 days. Schedule weekly outside business hours.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/settings/datamanagement",
+      "Snippet": "# UI-only. Open:\n#   https://make.powerapps.com/environments/{ENV_ID}/settings/datamanagement\n# Navigate: Data management -> Bulk record deletion -> New"
+    },
+    "OLD_COMPLETED_JOBS_NOT_CLEANED": {
+      "Why": "Completed async operations >90 days old are the largest cleanup opportunity in most tenants. They cascade-delete their WorkflowLog children.",
+      "Fix": "Add a weekly Bulk Delete Job: Entity = System Jobs; Status Reason in (Succeeded, Canceled, Failed); Created On older than 90 days.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/settings/datamanagement",
+      "Snippet": "# UI-only. Open:\n#   https://make.powerapps.com/environments/{ENV_ID}/settings/datamanagement"
+    },
+    "HIGH_SUSPENDED_JOBS": {
+      "Why": "Suspended system jobs signal a broken plugin or infinite-loop workflow. Each suspended job holds its payload in AsyncOperationBase until resolved.",
+      "Fix": "Investigate root cause first: Settings -> System -> System Jobs (filter Status = Suspended). After fixing the offending customization, bulk-delete the suspended backlog.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=jobsdashboard",
+      "Snippet": "# Query suspended jobs via Dataverse Web API:\n$tok = (Get-AzAccessToken -ResourceUrl \"https://{ORG_HOST}\").Token\n$h   = @{ Authorization = \"Bearer $tok\" }\nInvoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/asyncoperations?`$filter=statecode eq 2&`$select=name,operationtype,errorcode,message&`$top=50\" -Headers $h"
+    },
+    "HIGH_FAILED_JOBS_30D": {
+      "Why": "A high failure rate in the last 30 days indicates active breakage — typically a failing plugin, flow, or data import.",
+      "Fix": "Identify the top offenders first, fix the root cause, then add a recurring Bulk Delete job for Failed jobs >30d.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=jobsdashboard",
+      "Snippet": "# Top 10 recent failed jobs by name:\n$tok = (Get-AzAccessToken -ResourceUrl \"https://{ORG_HOST}\").Token\n$h   = @{ Authorization = \"Bearer $tok\"; Prefer = 'odata.include-annotations=\"*\"' }\n(Invoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/asyncoperations?`$filter=statuscode eq 31&`$select=name,message,errorcode,createdon&`$orderby=createdon desc&`$top=10\" -Headers $h).value"
+    },
+    "PLUGIN_TRACE_LOGGING_ENABLED": {
+      "Why": "Plugin trace logging fills Log storage rapidly. Intended for short-lived debugging only — never leave on in Production.",
+      "Fix": "Advanced Settings -> Administration -> System Settings -> Customization tab -> 'Enable logging to plug-in trace log' = Off. Then clear existing trace records.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=systemsetting",
+      "Snippet": "# Disable via Dataverse Web API (organization.plugintracelogsetting = 0):\n$tok = (Get-AzAccessToken -ResourceUrl \"https://{ORG_HOST}\").Token\n$h   = @{ Authorization = \"Bearer $tok\"; 'OData-Version'='4.0'; 'Content-Type'='application/json' }\n$orgId = (Invoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/organizations?`$select=organizationid\" -Headers $h).value[0].organizationid\nInvoke-RestMethod -Method PATCH -Uri \"https://{ORG_HOST}/api/data/v9.2/organizations($orgId)\" -Headers $h -Body '{\"plugintracelogsetting\": 0}'"
+    },
+    "AUDIT_RETENTION_SET_TO_FOREVER": {
+      "Why": "AuditBase grows unbounded when retention is 'Forever'. Storage cost compounds every month.",
+      "Fix": "Set a retention period (e.g., 365 days) in global audit settings, then delete existing logs older than your new retention window.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/auditandlogs",
+      "Snippet": "# Set retention via Web API (retainauditforever=false, auditretentionperioddays=365):\n$tok = (Get-AzAccessToken -ResourceUrl \"https://{ORG_HOST}\").Token\n$h   = @{ Authorization = \"Bearer $tok\"; 'OData-Version'='4.0'; 'Content-Type'='application/json' }\n$orgId = (Invoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/organizations?`$select=organizationid\" -Headers $h).value[0].organizationid\nInvoke-RestMethod -Method PATCH -Uri \"https://{ORG_HOST}/api/data/v9.2/organizations($orgId)\" -Headers $h -Body '{\"retainauditforever\": false, \"auditretentionperioddays\": 365}'"
+    },
+    "MAILBOX_SYNC_ERRORS": {
+      "Why": "A mailbox in error state stops syncing Exchange activity and also generates TraceLog (Alert) entries that silently accumulate.",
+      "Fix": "Settings -> Email Configuration -> Mailboxes. Filter on Status Reason = Error. Re-test each mailbox and resolve the underlying credential / permission issue.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=entitylist&etn=mailbox",
+      "Snippet": "# List mailboxes in error via Web API:\n$tok = (Get-AzAccessToken -ResourceUrl \"https://{ORG_HOST}\").Token\n$h   = @{ Authorization = \"Bearer $tok\" }\n(Invoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/mailboxes?`$filter=statuscode eq 3&`$select=name,emailaddress,testemailconfigurationscheduled\" -Headers $h).value"
+    },
+    "BROKEN_CONNECTION_REFERENCES": {
+      "Why": "A connection reference with no live connection breaks every flow and canvas app that binds to it — often silently until a user clicks.",
+      "Fix": "Open each broken reference in the solution explorer. Either rebind to an existing connection or create a new one.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/connections",
+      "Snippet": "# List connection references and their binding state:\n# Requires Microsoft.PowerApps.Administration.PowerShell\nGet-AdminPowerAppConnection -EnvironmentName \"{ENV_ID}\" | Where-Object { -not $_.Statuses -or $_.Statuses[0].status -ne 'Connected' } | Select-Object ConnectorName,DisplayName,Statuses"
+    },
+    "ACTIVE_FLOWS_OWNED_BY_DISABLED_USERS": {
+      "Why": "When the owning user is disabled, every connection owned by that user expires — usually silently. Flow stops working without an error the business sees.",
+      "Fix": "Reassign the flow to an active service account or owner group. Repeat for every affected flow.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "# Reassign one flow to a new owner (replace OIDs):\n# Requires Microsoft.PowerApps.Administration.PowerShell\nSet-AdminFlowOwnerRole -EnvironmentName \"{ENV_ID}\" `\n  -FlowName \"<flow-guid>\" -PrincipalType User `\n  -PrincipalObjectId \"<new-owner-oid>\" -RoleName Owner"
+    },
+    "CLOUD_FLOWS_OWNED_BY_DISABLED_USERS": {
+      "Why": "Cloud flows owned by disabled users will break the moment their connections expire. This is active breakage-in-waiting.",
+      "Fix": "Reassign or co-own each flow to an active owner (preferably a service account or M365 group).",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "# Bulk list of flows owned by a disabled user:\nGet-AdminFlow -EnvironmentName \"{ENV_ID}\" |\n  Where-Object { $_.CreatedBy.userId -eq '<disabled-user-oid>' } |\n  Select-Object FlowName,DisplayName,Enabled,CreatedBy"
+    },
+    "ORPHANED_CANVAS_APPS": {
+      "Why": "Canvas apps whose owner has left the tenant cannot be updated and will eventually break when embedded connections expire.",
+      "Fix": "Reassign owner to a service account or delete if unused.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/apps",
+      "Snippet": "# Reassign canvas app owner:\nSet-AdminPowerAppOwner -EnvironmentName \"{ENV_ID}\" `\n  -AppName \"<app-guid>\" -AppOwner \"<new-owner-oid>\""
+    },
+    "UNCERTIFIED_CUSTOM_CONNECTORS": {
+      "Why": "Custom connectors that haven't been certified bypass the normal review process. They often touch sensitive endpoints with no DLP enforcement.",
+      "Fix": "Review each connector's OpenAPI definition and target host. Retire, replace with a certified alternative, or submit for certification.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/customconnectors",
+      "Snippet": "Get-AdminPowerAppConnector -EnvironmentName \"{ENV_ID}\" |\n  Where-Object { -not $_.IsCertified } |\n  Select-Object DisplayName,ConnectorId,CreatedBy"
+    },
+    "NO_DLP_POLICIES_CONFIGURED": {
+      "Why": "With zero DLP policies, any maker can combine any two connectors — including HTTP + SharePoint, a classic exfiltration pattern.",
+      "Fix": "Define at least one tenant-wide DLP policy. Start by classifying HTTP, Custom Connectors, and SQL as Business/Non-Business/Blocked.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/policies",
+      "Snippet": "# Create a tenant-wide DLP policy that blocks HTTP in non-business:\nNew-DlpPolicy -DisplayName 'Tenant-wide default DLP' `\n  -EnvironmentType 'AllEnvironments'\n# Then classify connectors with Add-ConnectorToBusinessDataGroup / ...NonBusinessDataGroup / ...BlockedGroup"
+    },
+    "DLP_POLICY_MISSING_ON_PRODUCTION": {
+      "Why": "A production environment with no DLP policy can silently leak data through maker-built flows and apps.",
+      "Fix": "Add this environment to an existing All/AllExcept DLP policy, or create an environment-specific policy covering it.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/policies",
+      "Snippet": "# Add the env to a specific-scope DLP policy:\nAdd-PowerAppsEnvironment -EnvironmentName \"{ENV_ID}\" `\n  -PolicyName \"<dlp-policy-guid>\""
+    },
+    "PROD_ALLOWS_HTTP_CONNECTOR": {
+      "Why": "The generic HTTP connector can call any URL and bypass DLP classification for the target. On Production, this is a meaningful exfil path.",
+      "Fix": "In the DLP policy covering this env, move the 'HTTP' connector to the Blocked group (or at minimum to the Non-Business group if blocking breaks existing workloads).",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/policies",
+      "Snippet": "Add-ConnectorToBlockedGroup -PolicyName '<dlp-policy-guid>' `\n  -ConnectorName 'shared_webcontents'"
+    },
+    "TENANT_ISOLATION_DISABLED": {
+      "Why": "Without tenant isolation, makers can create connections from your tenant's Power Platform to other tenants' services (and vice versa).",
+      "Fix": "Enable tenant isolation in the Power Platform admin center; allowlist only the inbound/outbound tenants you genuinely need.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/ext/tenantsettings/tenantisolation",
+      "Snippet": "# UI-only. Open:\n#   https://admin.powerplatform.microsoft.com/ext/tenantsettings/tenantisolation"
+    },
+    "PRODUCTION_NOT_MANAGED_ENVIRONMENT": {
+      "Why": "Managed Environments unlock Weekly Digest, Solution Checker enforcement, sharing limits, and audit reporting — governance controls that don't exist outside it.",
+      "Fix": "Enable Managed Environments for this production env. Requires Power Platform Premium or Microsoft 365 E3+ licenses for users in the env.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "Set-AdminPowerAppEnvironmentRuntimeState -EnvironmentName \"{ENV_ID}\" -RuntimeState Enabled\nSet-AdminPowerAppManagedEnvironment -EnvironmentName \"{ENV_ID}\""
+    },
+    "MANAGED_ENV_SOLUTION_CHECKER_OFF": {
+      "Why": "Without Solution Checker enforcement, known-bad patterns (insecure HTTP calls, missing error handling) ship to production unchecked.",
+      "Fix": "Enable Solution Checker enforcement on this Managed Environment.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/settings",
+      "Snippet": "Set-AdminPowerAppManagedEnvironment -EnvironmentName \"{ENV_ID}\" `\n  -SolutionCheckerMode Warn  # or 'Block'"
+    },
+    "MANAGED_ENV_WEEKLY_DIGEST_DISABLED": {
+      "Why": "The weekly digest is the primary forcing function for admins to notice drift. Off = drift is invisible until someone goes looking.",
+      "Fix": "Enable the weekly digest email on this Managed Environment.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/settings",
+      "Snippet": "Set-AdminPowerAppManagedEnvironment -EnvironmentName \"{ENV_ID}\" `\n  -WeeklyDigestEnabled $true"
+    },
+    "SYSTEM_ADMIN_OVERASSIGNED": {
+      "Why": "Every System Administrator can read and modify every row. On Production this is a meaningful insider-risk and compliance issue.",
+      "Fix": "Review the list of sysadmin holders. Downgrade anyone who doesn't need tenant-wide admin; prefer scoped roles (System Customizer, env-specific security roles).",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/users",
+      "Snippet": "# List active users holding sys admin in this env:\n$tok = (Get-AzAccessToken -ResourceUrl \"https://{ORG_HOST}\").Token\n$h   = @{ Authorization = \"Bearer $tok\" }\n$sa  = (Invoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/roles?`$filter=name eq 'System Administrator'&`$select=roleid\" -Headers $h).value[0].roleid\n(Invoke-RestMethod -Uri \"https://{ORG_HOST}/api/data/v9.2/systemusers?`$filter=systemuserroles_association/any(r:r/roleid eq $sa) and isdisabled eq false&`$select=fullname,domainname\" -Headers $h).value"
+    },
+    "NON_ADMIN_CAN_CREATE_ENVIRONMENTS": {
+      "Why": "When anyone can spin up environments, DLP coverage breaks immediately (new envs bypass 'specific' scope policies).",
+      "Fix": "Lock environment creation to admins only in the Power Platform admin center.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/ext/tenantsettings/environment",
+      "Snippet": "# UI-only. Admin center -> Settings -> Who can create production/sandbox = 'Only specific admins'"
+    },
+    "NON_ADMIN_CAN_CREATE_TRIAL_ENVIRONMENTS": {
+      "Why": "Trial environments are often overlooked by governance scans yet can still hit Dataverse, Graph, and SharePoint with makers' credentials.",
+      "Fix": "Lock trial environment creation to admins only.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/ext/tenantsettings/environment",
+      "Snippet": "# UI-only. Admin center -> Settings -> Who can create trial environments"
+    },
+    "NO_CUSTOM_SECURITY_ROLES": {
+      "Why": "Relying solely on OOB roles forces sysadmins to over-assign. Every org benefits from at least one custom read-only / reporting role.",
+      "Fix": "Create a custom role mirroring your most common job function and assign it instead of sysadmin.",
+      "DeepLink": "https://{ORG_HOST}/tools/systemcustomization/securityroles/manageroles.aspx",
+      "Snippet": "# UI-only. Navigate: Advanced Settings -> Security -> Security Roles -> New"
+    },
+    "FO_BATCH_JOBS_IN_ERROR": {
+      "Why": "F&O batch jobs in Error state stall processing chains. Downstream jobs wait, history tables grow, users see missing data.",
+      "Fix": "In F&O: System administration -> Inquiries -> Batch jobs (filter Status = Error). Fix the root error, then resume or cancel the job.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "# UI-only. Open F&O: System administration -> Inquiries -> Batch jobs -> filter Status = Error"
+    },
+    "FO_MISSING_CLEANUP_JOBS": {
+      "Why": "Missing cleanup jobs let F&O history tables (BatchJobHistory, DIXF staging, SalesParmLine, etc.) grow indefinitely.",
+      "Fix": "See the Storage Cleanup Recommendations section for a per-job menu path. Schedule each missing cleanup as a recurring batch (180-day retention is a good starting default).",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "# UI-only. Each missing job has its own menu path in the Storage Cleanup Recommendations table below."
+    },
+    "FO_CLEANUP_JOBS_NOT_ENABLED": {
+      "Why": "A disabled cleanup job is the same as a missing one — the history keeps growing.",
+      "Fix": "Re-enable the batch job. Status should transition to Waiting/Executing on the next schedule.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "# UI-only. F&O -> System administration -> Inquiries -> Batch jobs -> find the job -> Functions -> Change status -> Waiting"
+    },
+    "FO_CLEANUP_JOBS_IN_ERROR": {
+      "Why": "A cleanup job in Error usually fails the same way every run until the root cause is fixed, so history continues to grow.",
+      "Fix": "Open the batch job, read the log, fix the underlying condition (permission, lock, bad parameter), then Reset and re-enable.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/hub",
+      "Snippet": "# UI-only. F&O -> Batch jobs -> select job -> View log to diagnose -> Functions -> Reset status"
+    },
+    "DUALWRITE_MAPS_IN_ERROR": {
+      "Why": "A DualWrite table map in Error stops replication for that table in one or both directions. Data drift between CE and F&O starts immediately.",
+      "Fix": "Open the DualWrite admin page for this env, select the failing map, review the initial-sync or running errors, and resume/retry once the root cause is addressed.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/dual-write/table-maps",
+      "Snippet": "# UI-only. make.powerapps.com -> env -> Dual-write -> Table maps -> filter Status = Error"
+    },
+    "ENV_VARS_MISSING_VALUES": {
+      "Why": "An environment variable without a value falls back to its default; for prod flows that expect a real value this silently causes wrong behavior.",
+      "Fix": "Solutions -> [target solution] -> open the environment variable -> set Current Value. Prefer adding the value through the solution layer, not the default layer.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/solutions",
+      "Snippet": "# List env vars with no value set:\nGet-AdminPowerAppEnvironmentVariable -EnvironmentName \"{ENV_ID}\" |\n  Where-Object { -not $_.CurrentValue -or $_.CurrentValue.Length -eq 0 } |\n  Select-Object DisplayName,SchemaName,DefaultValue"
+    },
+    "NO_DUPLICATE_DETECTION_RULES": {
+      "Why": "Without detection rules, duplicate Accounts/Contacts/Leads accumulate silently — fatal for reporting, segmentation, and outreach.",
+      "Fix": "Create at least the default Account/Contact/Lead rules and publish them. Verify the recurring Dup Detection job is scheduled.",
+      "DeepLink": "https://{ORG_HOST}/tools/DuplicateDetectionRules/home_DuplicateDetectionRules.aspx",
+      "Snippet": "# UI-only. Advanced Settings -> Data Management -> Duplicate Detection Rules -> New"
+    },
+    "NO_RETENTION_POLICIES": {
+      "Why": "Retention policies are the managed path to delete data on schedule while respecting legal hold. Without them, the only option is Bulk Delete — which does not respect hold.",
+      "Fix": "Create a retention policy per sensitive table (Accounts, Cases, Contacts) with your org's retention period.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/retention",
+      "Snippet": "# UI-only. make.powerapps.com -> env -> Settings -> Retention policies -> New"
+    },
+    "NO_RECENT_USER_BACKUPS": {
+      "Why": "Manual backups are the fastest restore path for 'I deleted the wrong thing' scenarios. System backups exist but reset a much wider scope.",
+      "Fix": "Take a manual backup before risky operations. Admins can also schedule one ahead of each deployment.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/backups",
+      "Snippet": "# UI-only. Admin center -> env -> Backups -> Create (enter a label)"
+    },
+    "NOT_IN_ENVIRONMENT_GROUP": {
+      "Why": "Environment Groups apply shared rules (DLP, sharing, solution checker) to every env inside. Without membership, this env drifts from tenant policy.",
+      "Fix": "Add the env to the appropriate Environment Group in the Power Platform admin center.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/ext/environmentgroups",
+      "Snippet": "# UI-only. Admin center -> Environment groups -> [group] -> Add environments"
+    },
+    "NO_DEDICATED_ENVIRONMENT_ADMIN": {
+      "Why": "An env with no dedicated Environment Admin role has no accountable owner. When something breaks, nobody is paged.",
+      "Fix": "Assign the Environment Admin role (preferably to a security group, not an individual user) in the admin center.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/users",
+      "Snippet": "# UI-only. Admin center -> env -> Settings -> Users + permissions -> Environment admin"
+    },
+    "ENVIRONMENT_ADMIN_IS_USER_NOT_GROUP": {
+      "Why": "If the only admin leaves the company, the env becomes unowned. Groups survive people changes; individuals don't.",
+      "Fix": "Replace the individual Environment Admin assignment with an M365/AD security group.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/users",
+      "Snippet": "# UI-only. Admin center -> env -> Settings -> Users + permissions -> Environment admin"
+    },
+    "DEEP_BUSINESS_UNIT_NESTING": {
+      "Why": "Business unit trees deeper than 4-5 levels start to break the security model in non-obvious ways (team visibility, cascading) and slow every security-role query.",
+      "Fix": "Flatten the tree. Prefer teams + field security profiles for segmentation instead of deep BU nesting.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=businessunit",
+      "Snippet": "# UI-only. Advanced Settings -> Security -> Business Units"
+    },
+    "LIFECYCLE_OP_FAILED_RECENTLY": {
+      "Why": "A failed copy/restore/reset usually leaves the source or target in a transitional state. Next op can compound the problem.",
+      "Fix": "Review the failure in the admin center, retry or cancel, and verify source/target health before scheduling the next lifecycle op.",
+      "DeepLink": "https://admin.powerplatform.microsoft.com/manage/environments/environment/{ENV_ID}/history",
+      "Snippet": "# UI-only. Admin center -> env -> History -> filter State = Failed"
+    },
+    "HIGH_UNMANAGED_SOLUTIONS": {
+      "Why": "A large unmanaged-solution footprint is a direct-customize-in-prod smell. ALM eventually becomes impossible to reason about.",
+      "Fix": "Consolidate and export as managed. Target state: unmanaged solutions only in dev environments.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/solutions",
+      "Snippet": "Get-CrmOrganization | Out-Null  # confirm connection\n# UI-driven ALM: export each unmanaged -> import as managed via pipeline"
+    },
+    "CONNECTIONS_IN_ERROR_STATE": {
+      "Why": "A connection in error state stops every flow and canvas app that binds to it. Typically a credential/consent drift.",
+      "Fix": "Open each erroring connection and re-authenticate. Where the owner has left, reassign first.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/connections",
+      "Snippet": "Get-AdminPowerAppConnection -EnvironmentName \"{ENV_ID}\" |\n  Where-Object { $_.Statuses -and $_.Statuses[0].status -ne 'Connected' } |\n  Select-Object ConnectorName,DisplayName,Statuses,CreatedBy"
+    },
+    "ORPHANED_CONNECTIONS": {
+      "Why": "A connection whose owner has left the tenant is one credential rotation away from breaking whatever uses it.",
+      "Fix": "Reassign each orphaned connection to an active service account or delete if nothing binds to it.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/connections",
+      "Snippet": "# Reassign a connection's owner (admin scope):\nSet-AdminPowerAppConnectionRoleAssignment -EnvironmentName \"{ENV_ID}\" `\n  -ConnectorName \"<connector-id>\" -ConnectionName \"<connection-guid>\" `\n  -RoleName CanEdit -PrincipalType User -PrincipalObjectId \"<new-owner-oid>\""
+    },
+    "HIGH_FLOW_RUN_FAILURE_RATE": {
+      "Why": "A flow with sustained failure rate > threshold is almost certainly broken and actively eating API request entitlements for nothing.",
+      "Fix": "Identify the worst offenders via the maker portal; fix, disable, or delete.",
+      "DeepLink": "https://make.powerapps.com/environments/{ENV_ID}/flows",
+      "Snippet": "# Get flows and check their enabled state + ownership:\nGet-AdminFlow -EnvironmentName \"{ENV_ID}\" |\n  Select-Object DisplayName,FlowName,Enabled,CreatedBy"
+    },
+    "HIGH_UNRESOLVED_DUPLICATES": {
+      "Why": "Every detection job run re-reports the same unresolved dup pair. DuplicateRecordBase grows, reports stay broken, users lose trust.",
+      "Fix": "Clear the backlog via Merge or Deactivate in Advanced Find. For large volumes, export the list, clean offline, and upsert.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=entitylist&etn=duplicaterecord",
+      "Snippet": "# UI-only. Advanced Find -> Look for = Duplicate Records -> triage by entity"
+    },
+    "HIGH_QUEUE_ITEM_BACKLOG": {
+      "Why": "A growing queue backlog usually means nobody's processing the queue anymore — either the assignee left or the routing rule is broken.",
+      "Fix": "Review the queue in the app, fix routing, and reassign stale items.",
+      "DeepLink": "https://{ORG_HOST}/main.aspx?pagetype=entitylist&etn=queueitem",
+      "Snippet": "# UI-only. Open the affected queues via app navigation"
+    }
+  }
+}

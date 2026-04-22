@@ -85,11 +85,19 @@ foreach ($envEntry in $master.Environments) {
 
     $ceSummary = if (Test-Path $ceSummaryFile) { Get-Content $ceSummaryFile -Raw | ConvertFrom-Json } else { $null }
     $foSummary = if (Test-Path $foSummaryFile) { Get-Content $foSummaryFile -Raw | ConvertFrom-Json } else { $null }
+    $meta      = if (Test-Path $metaFile)      { Get-Content $metaFile      -Raw | ConvertFrom-Json } else { $null }
     $maker     = if (Test-Path $makerFile)     { Get-Content $makerFile     -Raw | ConvertFrom-Json } else { $null }
     $gov       = if (Test-Path $govFile)       { Get-Content $govFile       -Raw | ConvertFrom-Json } else { $null }
     $rbac      = if (Test-Path $rbacFile)      { Get-Content $rbacFile      -Raw | ConvertFrom-Json } else { $null }
     $md        = if (Test-Path $mdFile)        { Get-Content $mdFile        -Raw | ConvertFrom-Json } else { $null }
     $activity  = if (Test-Path $actFile)       { Get-Content $actFile       -Raw | ConvertFrom-Json } else { $null }
+
+    # Extract OrgUrl/Host for deep-link token expansion in fix snippets
+    $orgUrl = $null; $orgHost = $null
+    if ($meta -and $meta.OrgUrl) {
+        $orgUrl  = [string]$meta.OrgUrl
+        try { $orgHost = ([Uri]$orgUrl).Host } catch { $orgHost = $null }
+    }
 
     $detail = [PSCustomObject]@{
         EnvironmentId   = $envEntry.EnvironmentId
@@ -106,6 +114,8 @@ foreach ($envEntry in $master.Environments) {
         HasDataverse    = $envEntry.HasDataverse
         HasFO           = $envEntry.HasFO
         AllFlags        = @($envEntry.AllFlags)
+        OrgUrl          = $orgUrl
+        OrgHost         = $orgHost
         CE              = $ceSummary
         FO              = $foSummary
         Maker           = $maker
@@ -292,6 +302,48 @@ if (Test-Path $entityIgnoreFile) {
     } catch {
         Write-Host "  Warning: Could not parse entity-count-ignore.json" -ForegroundColor Yellow
     }
+}
+
+# Flag fix snippets — per-flag Why / Fix / DeepLink / Snippet for inline rendering in the Action Plan
+$flagFixes = @{}
+$flagFixesFile = Join-Path $configDir 'flag-fixes.json'
+if (Test-Path $flagFixesFile) {
+    try {
+        $ffRaw = Get-Content $flagFixesFile -Raw | ConvertFrom-Json
+        if ($ffRaw.Fixes) {
+            foreach ($prop in $ffRaw.Fixes.PSObject.Properties) {
+                if ($prop.Name -notmatch '^_') { $flagFixes[$prop.Name] = $prop.Value }
+            }
+        }
+        Write-Host "  Loaded $($flagFixes.Count) flag-fix snippets" -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  Warning: Could not parse flag-fixes.json: $_" -ForegroundColor Yellow
+    }
+}
+
+function Get-FlagFix {
+    param([string]$Flag)
+    if (-not $Flag) { return $null }
+    $flagName = ($Flag -split '\s*\(')[0].Trim()
+    if ($flagFixes.ContainsKey($flagName)) { return $flagFixes[$flagName] }
+    return $null
+}
+
+# Replace {ENV_ID}, {ENV_NAME}, {ORG_URL}, {ORG_HOST}, {TENANT_ID} with per-env values.
+# Keeps literal tokens when data is unavailable so the snippet is still self-describing.
+function Expand-FixTokens {
+    param([string]$Text, [PSObject]$Env, [string]$TenantId)
+    if (-not $Text) { return '' }
+    $envId   = if ($Env -and $Env.EnvironmentId) { [string]$Env.EnvironmentId } else { '{ENV_ID}' }
+    $envName = if ($Env -and $Env.DisplayName)   { [string]$Env.DisplayName   } else { '{ENV_NAME}' }
+    $orgUrl  = if ($Env -and $Env.OrgUrl)  { [string]$Env.OrgUrl  } else { '{ORG_URL}' }
+    $orgHost = if ($Env -and $Env.OrgHost) { [string]$Env.OrgHost } else { '{ORG_HOST}' }
+    $tid     = if ($TenantId) { [string]$TenantId } else { '{TENANT_ID}' }
+    return $Text.Replace('{ENV_ID}', $envId).
+                  Replace('{ENV_NAME}', $envName).
+                  Replace('{ORG_URL}', $orgUrl).
+                  Replace('{ORG_HOST}', $orgHost).
+                  Replace('{TENANT_ID}', $tid)
 }
 
 # ── Governance score computation ─────────────────────────────────────────────
@@ -499,8 +551,172 @@ if (Test-Path $runHistoryDir) {
     }
 }
 
-# ── Build HTML rows for environments table ────────────────────────────────────
 Add-Type -AssemblyName System.Web
+
+# ── Priority Action Plan (ranked top-N across tenant) ────────────────────────
+# Each flag is scored: severityWeight (from flag-severity.json) × skuWeight (from sku-profiles.json)
+# × blastRadius (log10 of the parenthetical count, if any; otherwise 1). Highest scores float up,
+# so the result is the top issues to fix tenant-wide — severity, SKU importance, and scale combined.
+$actionPlan = [System.Collections.Generic.List[PSObject]]::new()
+foreach ($e in $envDetails) {
+    $skuWeight = if ($skuProfiles.ContainsKey($e.Sku) -and $skuProfiles[$e.Sku].GovernanceWeight) {
+                     [double]$skuProfiles[$e.Sku].GovernanceWeight
+                 } else { 1.0 }
+    $suppressList = if ($skuProfiles.ContainsKey($e.Sku) -and $skuProfiles[$e.Sku].Suppress) {
+                        @($skuProfiles[$e.Sku].Suppress)
+                    } else { @() }
+
+    foreach ($f in $e.AllFlags) {
+        $flagName = ($f -split '\s*\(')[0].Trim()
+        # SKU-suppressed flags: expected for this env type, don't surface in action plan
+        if ($flagName -in $suppressList) { continue }
+
+        $sev = Get-FlagSeverity $f
+        $sevW = switch ($sev) {
+            'Critical' { 15.0 }
+            'High'     { 8.0  }
+            'Medium'   { 4.0  }
+            'Low'      { 1.0  }
+            default    { 0.0  }
+        }
+        if ($sevW -eq 0) { continue }  # skip info-only flags
+
+        # Blast radius from parenthetical count ("HIGH_FAILED_JOBS_30D (12 jobs)" → use 12)
+        $blast = 1.0
+        if ($f -match '\(\s*([0-9]+(?:[,0-9]+)?)') {
+            $n = [double]($matches[1] -replace ',','')
+            if ($n -gt 0) { $blast = [Math]::Max(1.0, [Math]::Log10($n + 10)) }
+        }
+
+        $priority = $sevW * $skuWeight * $blast
+
+        $actionPlan.Add([PSCustomObject]@{
+            Env      = $e
+            Flag     = $f
+            FlagName = $flagName
+            Severity = $sev
+            SevW     = $sevW
+            SkuW     = $skuWeight
+            Blast    = $blast
+            Priority = $priority
+        })
+    }
+}
+$topActions = @($actionPlan | Sort-Object -Property Priority -Descending | Select-Object -First 15)
+Write-Host "  Priority action plan: $($topActions.Count) top items (out of $($actionPlan.Count) scored flags)" -ForegroundColor Cyan
+
+# ── Trends & Forecast (all run-history snapshots) ───────────────────────────
+# Loads every snapshot in data/run-history, recomputes per-snapshot tenant score + flag breakdown
+# + storage totals, and builds a per-env storage history for linear-regression forecasting.
+$trendData   = [System.Collections.Generic.List[PSObject]]::new()
+$envHistory  = @{}
+$trendLabels = [System.Collections.Generic.List[string]]::new()
+
+if (Test-Path $runHistoryDir) {
+    $allSnapshots = @(Get-ChildItem -Path $runHistoryDir -Filter '*.json' | Sort-Object Name)
+    foreach ($sf in $allSnapshots) {
+        try {
+            $snap = Get-Content $sf.FullName -Raw | ConvertFrom-Json
+            $runAt = $null
+            try { $runAt = [datetime]$snap.RunAt } catch { $runAt = $null }
+            if (-not $runAt) {
+                # Fall back to filename: YYYY-MM-DD_HHMMSS
+                if ($sf.BaseName -match '^(\d{4}-\d{2}-\d{2})[_ ](\d{2})(\d{2})(\d{2})$') {
+                    $runAt = [datetime]"$($matches[1])T$($matches[2]):$($matches[3]):$($matches[4])"
+                } else { continue }
+            }
+
+            $totDb = 0.0; $totFile = 0.0; $totLog = 0.0
+            $critN = 0; $highN = 0; $medN = 0; $lowN = 0
+            $wSum  = 0.0; $wTot = 0.0
+
+            foreach ($se in $snap.Environments) {
+                $totDb   += [double]$se.StorageDB_MB
+                $totFile += [double]$se.StorageFile_MB
+                $totLog  += [double]$se.StorageLog_MB
+
+                $sFlags = @($se.AllFlags)
+                foreach ($sf2 in $sFlags) {
+                    switch (Get-FlagSeverity $sf2) {
+                        'Critical' { $critN++ }
+                        'High'     { $highN++ }
+                        'Medium'   { $medN++ }
+                        'Low'      { $lowN++ }
+                    }
+                }
+
+                $sSku = [string]$se.EnvironmentSku
+                $sw = if ($skuProfiles.ContainsKey($sSku) -and $skuProfiles[$sSku].GovernanceWeight) {
+                          [double]$skuProfiles[$sSku].GovernanceWeight
+                      } else { 1.0 }
+                $sScore = Get-GovernanceScore -Flags $sFlags -Sku $sSku
+                $wSum += $sScore * $sw
+                $wTot += $sw
+
+                # Per-env storage history for forecasting
+                if (-not $envHistory.ContainsKey($se.EnvironmentId)) {
+                    $envHistory[$se.EnvironmentId] = [System.Collections.Generic.List[PSObject]]::new()
+                }
+                $envHistory[$se.EnvironmentId].Add([PSCustomObject]@{
+                    RunAt   = $runAt
+                    TotalMB = [double]$se.StorageTotal_MB
+                    DbMB    = [double]$se.StorageDB_MB
+                    FileMB  = [double]$se.StorageFile_MB
+                    LogMB   = [double]$se.StorageLog_MB
+                })
+            }
+
+            $tScore = if ($wTot -gt 0) { [Math]::Round($wSum / $wTot, 1) } else { 0.0 }
+            $trendLabels.Add($runAt.ToString('yyyy-MM-dd HH:mm'))
+            $trendData.Add([PSCustomObject]@{
+                RunAt     = $runAt
+                TotalDbGB   = [Math]::Round($totDb   / 1024.0, 2)
+                TotalFileGB = [Math]::Round($totFile / 1024.0, 2)
+                TotalLogGB  = [Math]::Round($totLog  / 1024.0, 2)
+                TotalGB     = [Math]::Round(($totDb + $totFile + $totLog) / 1024.0, 2)
+                Critical  = $critN
+                High      = $highN
+                Medium    = $medN
+                Low       = $lowN
+                Score     = $tScore
+            })
+        } catch {
+            Write-Host "  Warning: could not parse snapshot $($sf.Name): $_" -ForegroundColor Yellow
+        }
+    }
+}
+Write-Host "  Trends: loaded $($trendData.Count) run-history snapshots" -ForegroundColor Cyan
+
+# Ordinary least squares forecast — returns null if fewer than 2 points or zero variance in X.
+function Invoke-LinearForecast {
+    param([object[]]$Points, [string]$YField)
+    if (-not $Points -or $Points.Count -lt 2) { return $null }
+    $xs = @($Points | ForEach-Object { [double]($_.RunAt - [datetime]'1970-01-01').TotalDays })
+    $ys = @($Points | ForEach-Object { [double]$_.$YField })
+    $n = $xs.Count
+    $sx = 0.0; $sy = 0.0; $sxy = 0.0; $sxx = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $sx += $xs[$i]; $sy += $ys[$i]
+        $sxy += $xs[$i] * $ys[$i]; $sxx += $xs[$i] * $xs[$i]
+    }
+    $denom = ($n * $sxx) - ($sx * $sx)
+    if ($denom -eq 0) { return $null }
+    $slope     = (($n * $sxy) - ($sx * $sy)) / $denom
+    $intercept = ($sy - ($slope * $sx)) / $n
+
+    # R² — coefficient of determination
+    $meanY = $sy / $n
+    $ssTot = 0.0; $ssRes = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $pred   = ($slope * $xs[$i]) + $intercept
+        $ssRes += [Math]::Pow($ys[$i] - $pred, 2)
+        $ssTot += [Math]::Pow($ys[$i] - $meanY, 2)
+    }
+    $r2 = if ($ssTot -gt 0) { 1 - ($ssRes / $ssTot) } else { 1.0 }
+    return @{ Slope = $slope; Intercept = $intercept; R2 = $r2; N = $n }
+}
+
+# ── Build HTML rows for environments table ────────────────────────────────────
 
 function Build-EnvTableRows {
     param([object[]]$Envs)
@@ -1345,10 +1561,247 @@ $mdHtml = if ($mdRowsHtml) {
     "<section id='metadata-depth' class='mb-5'><div class='section-header'><h5 class='mb-0'>Metadata &amp; Lifecycle</h5></div><div class='alert alert-secondary'>No metadata depth data. Re-run with <code>-IncludeMetadataDepth</code>.</div></section>"
 }
 
-# ── HTML template ─────────────────────────────────────────────────────────────
 $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 $tenantId    = $master.TenantId
 $authAs      = $master.AuthenticatedAs
+
+# ── Priority Action Plan rows ─────────────────────────────────────────────────
+$actionPlanRows = ''
+$rank = 0
+foreach ($act in $topActions) {
+    $rank++
+    $envForAct = $act.Env
+    $nameEsc = [System.Web.HttpUtility]::HtmlEncode([string]$envForAct.DisplayName)
+    $skuEsc  = [System.Web.HttpUtility]::HtmlEncode([string]$envForAct.Sku)
+    $flagEsc = [System.Web.HttpUtility]::HtmlEncode([string]$act.Flag)
+
+    $sevBadgeClass = switch ($act.Severity) {
+        'Critical' { 'bg-danger' }
+        'High'     { 'bg-danger' }
+        'Medium'   { 'bg-warning text-dark' }
+        'Low'      { 'bg-secondary' }
+        default    { 'bg-secondary' }
+    }
+    $sevBadge = "<span class='badge $sevBadgeClass'>$($act.Severity)</span>"
+
+    $skuBadgeClass = switch ($envForAct.Sku) {
+        'Production' { 'bg-primary'    }
+        'Default'    { 'bg-primary'    }
+        'Sandbox'    { 'bg-info text-dark' }
+        'Developer'  { 'bg-success'    }
+        'Trial'      { 'bg-warning text-dark' }
+        default      { 'bg-secondary'  }
+    }
+    $skuBadge = "<span class='badge $skuBadgeClass ms-1'>$skuEsc</span>"
+
+    $fix = Get-FlagFix $act.FlagName
+    $fixCell = ''
+    if ($fix) {
+        $whyRaw  = Expand-FixTokens -Text ([string]$fix.Why)       -Env $envForAct -TenantId $tenantId
+        $fixRaw  = Expand-FixTokens -Text ([string]$fix.Fix)       -Env $envForAct -TenantId $tenantId
+        $snipRaw = Expand-FixTokens -Text ([string]$fix.Snippet)   -Env $envForAct -TenantId $tenantId
+        $linkRaw = Expand-FixTokens -Text ([string]$fix.DeepLink)  -Env $envForAct -TenantId $tenantId
+
+        $whyEsc  = [System.Web.HttpUtility]::HtmlEncode($whyRaw)
+        $fixEsc  = [System.Web.HttpUtility]::HtmlEncode($fixRaw)
+        $snipEsc = [System.Web.HttpUtility]::HtmlEncode($snipRaw)
+        $linkEsc = [System.Web.HttpUtility]::HtmlEncode($linkRaw)
+
+        # Only render the Open button if the URL has no unresolved {TOKEN}
+        $linkHtml = if ($linkRaw -and ($linkRaw -notmatch '\{[A-Z_]+\}')) {
+            "<a href='$linkEsc' target='_blank' rel='noopener' class='btn btn-sm btn-outline-primary me-2'>Open in portal &rarr;</a>"
+        } else { '' }
+
+        $snippetHtml = if ($snipRaw) {
+@"
+<details class='d-inline-block mt-2'>
+  <summary class='btn btn-sm btn-outline-secondary' style='list-style:none'>Show snippet</summary>
+  <div class='mt-2'>
+    <pre class='fix-snippet mb-1'>$snipEsc</pre>
+    <button type='button' class='btn btn-sm btn-outline-primary' onclick='copyFixSnippet(this)'>Copy</button>
+  </div>
+</details>
+"@
+        } else { '' }
+
+        $fixCell = @"
+<div class='small'><strong>Why:</strong> $whyEsc</div>
+<div class='small mt-1'><strong>Fix:</strong> $fixEsc</div>
+<div class='mt-2'>$linkHtml$snippetHtml</div>
+"@
+    } else {
+        $fixCell = "<div class='small text-muted'>No pre-baked fix snippet. Add one in <code>config/flag-fixes.json</code> keyed on <code>$([System.Web.HttpUtility]::HtmlEncode($act.FlagName))</code> if this flag recurs.</div>"
+    }
+
+    $actionPlanRows += @"
+<tr>
+  <td class='fw-bold'>$rank</td>
+  <td><strong>$nameEsc</strong>$skuBadge<br><small class='text-muted'>$($envForAct.EnvironmentId)</small></td>
+  <td>$sevBadge</td>
+  <td><code class='small'>$flagEsc</code></td>
+  <td>$fixCell</td>
+</tr>
+"@
+}
+
+$actionPlanHtml = if ($topActions.Count -gt 0) {
+@"
+<section id="action-plan" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Priority Action Plan &mdash; Top $($topActions.Count)</h5></div>
+  <p class="text-muted small">
+    Highest-priority issues across the tenant, ranked by <strong>severity &times; SKU weight &times; blast radius</strong>.
+    Severity is from <code>config/flag-severity.json</code>; SKU weight from <code>config/sku-profiles.json</code>
+    (Production 3&times;, Default 2&times;, Sandbox 1.5&times;, Developer 0.5&times;, Trial 0.25&times;);
+    blast radius uses the parenthetical count in the flag text (log<sub>10</sub> scale). SKU-suppressed flags are excluded.
+    Fix snippets come from <code>config/flag-fixes.json</code>; extend that file to tailor them to your organization.
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover table-bordered" style="width:100%">
+      <thead class="table-dark">
+        <tr>
+          <th style="width:50px">#</th>
+          <th style="width:18%">Environment</th>
+          <th style="width:100px">Severity</th>
+          <th style="width:22%">Issue</th>
+          <th>Why &amp; Fix</th>
+        </tr>
+      </thead>
+      <tbody>$actionPlanRows</tbody>
+    </table>
+  </div>
+</section>
+"@
+} else {
+@"
+<section id="action-plan" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Priority Action Plan</h5></div>
+  <div class="alert alert-success">No scored flags across the tenant &mdash; nothing to action right now.</div>
+</section>
+"@
+}
+
+# ── Trends & Forecast rows + JSON arrays for Chart.js ───────────────────────
+$forecastRows = ''
+foreach ($e in ($envDetails | Sort-Object StorageTotal_MB -Descending)) {
+    if (-not $envHistory.ContainsKey($e.EnvironmentId)) { continue }
+    $hist = @($envHistory[$e.EnvironmentId] | Sort-Object RunAt)
+    if ($hist.Count -lt 2) { continue }
+    $fc = Invoke-LinearForecast -Points $hist -YField 'TotalMB'
+    if (-not $fc) { continue }
+    $mbPerDay = [double]$fc.Slope
+    $r2       = [double]$fc.R2
+    $currMB   = [double]$e.StorageTotal_MB
+    $firstRunAt = $hist[0].RunAt
+    $lastRunAt  = $hist[-1].RunAt
+    $spanDays   = [Math]::Round(($lastRunAt - $firstRunAt).TotalDays, 1)
+
+    $daysTo150 = if ($mbPerDay -gt 0) { [Math]::Round($currMB * 0.5 / $mbPerDay, 0) } else { $null }
+    $daysTo200 = if ($mbPerDay -gt 0) { [Math]::Round($currMB / $mbPerDay, 0) } else { $null }
+
+    $rateCell = if ($mbPerDay -gt 0.5) {
+        "<span class='text-danger'>+$(Format-MB $mbPerDay)/day</span>"
+    } elseif ($mbPerDay -lt -0.5) {
+        "<span class='text-success'>$(Format-MB $mbPerDay)/day</span>"
+    } else {
+        "<span class='text-muted'>~flat</span>"
+    }
+
+    $days150Cell = if ($null -ne $daysTo150 -and $daysTo150 -gt 0 -and $daysTo150 -lt 3650) { "$daysTo150 d" } else { '&mdash;' }
+    $days200Cell = if ($null -ne $daysTo200 -and $daysTo200 -gt 0 -and $daysTo200 -lt 3650) { "$daysTo200 d" } else { '&mdash;' }
+
+    $r2Pct = [Math]::Round($r2 * 100, 0)
+    $r2Cls = if ($r2 -gt 0.85) { 'text-success' } elseif ($r2 -gt 0.6) { 'text-warning' } else { 'text-muted' }
+
+    $nameEsc = [System.Web.HttpUtility]::HtmlEncode([string]$e.DisplayName)
+    $forecastRows += @"
+<tr>
+  <td><strong>$nameEsc</strong><br><small class='text-muted'>$($e.Sku) &middot; $($hist.Count) points &middot; $spanDays d span</small></td>
+  <td>$(Format-MB $currMB)</td>
+  <td>$rateCell</td>
+  <td>$days150Cell</td>
+  <td>$days200Cell</td>
+  <td class='small $r2Cls'>$r2Pct%</td>
+</tr>
+"@
+}
+
+# Chart.js data arrays — single-line CSV numbers, safe to embed in JS literal arrays.
+$trendScoreCsv = ($trendData | ForEach-Object { [Math]::Round([double]$_.Score, 1) }) -join ','
+$trendDbCsv    = ($trendData | ForEach-Object { [double]$_.TotalDbGB })   -join ','
+$trendFileCsv  = ($trendData | ForEach-Object { [double]$_.TotalFileGB }) -join ','
+$trendLogCsv   = ($trendData | ForEach-Object { [double]$_.TotalLogGB })  -join ','
+$trendTotalCsv = ($trendData | ForEach-Object { [double]$_.TotalGB })     -join ','
+$trendCritCsv  = ($trendData | ForEach-Object { [int]$_.Critical })       -join ','
+$trendHighCsv  = ($trendData | ForEach-Object { [int]$_.High })           -join ','
+$trendMedCsv   = ($trendData | ForEach-Object { [int]$_.Medium })         -join ','
+$trendLowCsv   = ($trendData | ForEach-Object { [int]$_.Low })            -join ','
+$trendLabelsJs = ''
+if ($trendLabels.Count -gt 0) {
+    $trendLabelsJs = '"' + (@($trendLabels | ForEach-Object { $_.Replace('\','\\').Replace('"','\"') }) -join '","') + '"'
+}
+
+$trendsHtml = if ($trendData.Count -ge 2) {
+@"
+<section id="trends" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Trends &amp; Forecast</h5></div>
+  <p class="text-muted small">
+    Tenant-wide trend across <strong>$($trendData.Count) runs</strong> in <code>data/run-history/</code>.
+    Score and flag counts are recomputed per snapshot using the <em>current</em> <code>config/flag-severity.json</code>,
+    so changes to severity config retroactively reshape the history.
+    Per-environment storage forecast uses ordinary least-squares linear regression;
+    R&sup2; reports how linear the growth actually is (higher = more confident projection).
+  </p>
+
+  <div class="row g-3 mb-3">
+    <div class="col-lg-4">
+      <div class="card p-2"><h6 class="small text-muted mb-1">Tenant Governance Score (0&ndash;100)</h6>
+        <div class="chart-box"><canvas id="trendScoreChart"></canvas></div></div>
+    </div>
+    <div class="col-lg-4">
+      <div class="card p-2"><h6 class="small text-muted mb-1">Flag Count by Severity</h6>
+        <div class="chart-box"><canvas id="trendFlagChart"></canvas></div></div>
+    </div>
+    <div class="col-lg-4">
+      <div class="card p-2"><h6 class="small text-muted mb-1">Total Storage (GB)</h6>
+        <div class="chart-box"><canvas id="trendStorageChart"></canvas></div></div>
+    </div>
+  </div>
+
+  <h6 class="mt-3">Storage Forecast &mdash; Per-Environment Linear Regression</h6>
+  <p class="text-muted small">"Days to 1.5&times; / 2&times;" = days from now until each environment reaches 1.5&times; / 2&times; its current total storage, extrapolated from the growth rate. Flat/shrinking environments show em dashes.</p>
+  $(if ($forecastRows) {
+    @"
+  <div class='table-responsive'>
+    <table class='table table-sm table-bordered' style='max-width:900px'>
+      <thead class='table-secondary'>
+        <tr>
+          <th>Environment</th>
+          <th>Current Storage</th>
+          <th>Growth Rate</th>
+          <th>Days to 1.5&times;</th>
+          <th>Days to 2&times;</th>
+          <th>R&sup2;</th>
+        </tr>
+      </thead>
+      <tbody>$forecastRows</tbody>
+    </table>
+  </div>
+"@
+  } else {
+    "<p class='text-muted'>Need at least 2 run-history snapshots with matching environment IDs to build a forecast.</p>"
+  })
+</section>
+"@
+} else {
+@"
+<section id="trends" class="mb-5">
+  <div class="section-header"><h5 class="mb-0">Trends &amp; Forecast</h5></div>
+  <div class="alert alert-secondary">Need at least 2 runs in <code>data/run-history/</code> to compute trends. Currently found: <strong>$($trendData.Count)</strong>.</div>
+</section>
+"@
+}
+
+# ── HTML template ─────────────────────────────────────────────────────────────
 
 $html = @"
 <!DOCTYPE html>
@@ -1359,6 +1812,7 @@ $html = @"
   <title>PPAC Dataverse Inventory Report</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
   <link rel="stylesheet" href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     body { font-size: 0.875rem; }
     .nav-link { font-size: 0.85rem; }
@@ -1369,6 +1823,10 @@ $html = @"
     .badge { font-size: 0.7em; }
     pre { font-size: 0.8em; background: #f8f9fa; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto; }
     .toc a { display: block; padding: 3px 0; font-size: 0.85rem; }
+    .fix-snippet { font-size: 0.78em; background: #0b1020; color: #e6edf3; padding: 8px; border-radius: 4px; max-height: 300px; overflow: auto; white-space: pre-wrap; }
+    .chart-box { position: relative; height: 220px; width: 100%; }
+    details > summary { cursor: pointer; list-style: none; }
+    details > summary::-webkit-details-marker { display: none; }
     @media print { .no-print { display: none; } }
   </style>
 </head>
@@ -1390,7 +1848,9 @@ $html = @"
       <div class="card-body toc p-2">
         <a href="#summary">Executive Summary</a>
         <a href="#issues">Issue Overview</a>
+        <a href="#action-plan">Priority Action Plan</a>
         <a href="#delta">Changes (Delta)</a>
+        <a href="#trends">Trends &amp; Forecast</a>
         <a href="#governance">Governance Scores</a>
         <a href="#tenant-gov">Tenant Governance / DLP</a>
         <a href="#maker">Maker Inventory</a>
@@ -1502,7 +1962,11 @@ $html = @"
   <div class="row">$issueCardsHtml</div>
 </section>
 
+$actionPlanHtml
+
 $deltaHtml
+
+$trendsHtml
 
 <!-- GOVERNANCE SCORES -->
 <section id="governance" class="mb-5">
@@ -1796,6 +2260,27 @@ $(
 <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
 <script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
 <script>
+function copyFixSnippet(btn) {
+  try {
+    var pre = btn.parentNode.querySelector('pre.fix-snippet');
+    if (!pre) return;
+    var txt = pre.textContent || pre.innerText || '';
+    navigator.clipboard.writeText(txt).then(function() {
+      var orig = btn.textContent;
+      btn.textContent = 'Copied!';
+      btn.classList.add('btn-success');
+      btn.classList.remove('btn-outline-primary');
+      setTimeout(function() {
+        btn.textContent = orig;
+        btn.classList.remove('btn-success');
+        btn.classList.add('btn-outline-primary');
+      }, 1500);
+    }).catch(function() {
+      btn.textContent = 'Copy failed';
+    });
+  } catch(e) { btn.textContent = 'Copy failed'; }
+}
+
 `$(document).ready(function() {
   `$('#envTable').DataTable({
     pageLength: 25, order: [[4,'desc']],
@@ -1809,6 +2294,45 @@ $(
   if (`$('#makerTable').length) { `$('#makerTable').DataTable({ pageLength: 25 }); }
   if (`$('#rbacTable').length)  { `$('#rbacTable').DataTable({ pageLength: 25 }); }
   if (`$('#mdTable').length)    { `$('#mdTable').DataTable({ pageLength: 25 }); }
+
+  // ── Trends charts ─────────────────────────────────────────────────────
+  if (typeof Chart !== 'undefined' && document.getElementById('trendScoreChart')) {
+    var trendLabels = [$trendLabelsJs];
+    var commonOpts = {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { boxWidth: 10, font: { size: 10 } } } },
+      scales: { x: { ticks: { font: { size: 9 }, maxRotation: 45, minRotation: 45 } },
+                y: { ticks: { font: { size: 10 } } } }
+    };
+    new Chart(document.getElementById('trendScoreChart'), {
+      type: 'line',
+      data: { labels: trendLabels,
+        datasets: [{ label: 'Score', data: [$trendScoreCsv],
+          borderColor: '#0078d4', backgroundColor: 'rgba(0,120,212,0.15)',
+          tension: 0.2, fill: true, pointRadius: 3 }] },
+      options: Object.assign({}, commonOpts, { scales: Object.assign({}, commonOpts.scales, { y: { min: 0, max: 100, ticks: { font: { size: 10 } } } }) })
+    });
+    new Chart(document.getElementById('trendFlagChart'), {
+      type: 'line',
+      data: { labels: trendLabels, datasets: [
+        { label: 'Critical', data: [$trendCritCsv], borderColor: '#dc3545', backgroundColor: 'rgba(220,53,69,0.15)', tension: 0.2, pointRadius: 2 },
+        { label: 'High',     data: [$trendHighCsv], borderColor: '#fd7e14', backgroundColor: 'rgba(253,126,20,0.15)', tension: 0.2, pointRadius: 2 },
+        { label: 'Medium',   data: [$trendMedCsv],  borderColor: '#ffc107', backgroundColor: 'rgba(255,193,7,0.15)',  tension: 0.2, pointRadius: 2 },
+        { label: 'Low',      data: [$trendLowCsv],  borderColor: '#6c757d', backgroundColor: 'rgba(108,117,125,0.15)', tension: 0.2, pointRadius: 2 }
+      ]},
+      options: commonOpts
+    });
+    new Chart(document.getElementById('trendStorageChart'), {
+      type: 'line',
+      data: { labels: trendLabels, datasets: [
+        { label: 'Database', data: [$trendDbCsv],   borderColor: '#0d6efd', tension: 0.2, pointRadius: 2 },
+        { label: 'File',     data: [$trendFileCsv], borderColor: '#198754', tension: 0.2, pointRadius: 2 },
+        { label: 'Log',      data: [$trendLogCsv],  borderColor: '#6c757d', tension: 0.2, pointRadius: 2 },
+        { label: 'Total',    data: [$trendTotalCsv],borderColor: '#dc3545', tension: 0.2, pointRadius: 2, borderDash: [4,3] }
+      ]},
+      options: commonOpts
+    });
+  }
 });
 </script>
 </body>
