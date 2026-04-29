@@ -202,7 +202,21 @@ function Collect-FOEnvironmentData {
         }
     }
 
-    # ── 6. FO Cleanup Batch Jobs (well-known names) ───────────────────────────
+    # ── 6. FO Legal Entities ──────────────────────────────────────────────────
+    # Collected before cleanup-job analysis so the per-company coverage check
+    # below knows which LegalEntityIds to expect.
+    # $metadata: LegalEntity key is LegalEntityId. No Enabled/IsPrimary/IsVirtual
+    # field is exposed via OData -- those only exist on the backing table.
+    $legalEntities = Invoke-FOOData `
+        -Path 'LegalEntities?$select=LegalEntityId,Name,CompanyCountry' `
+        -SectionLabel 'Legal Entities' `
+        -SaveFileName 'fo-legal-entities.json'
+
+    $result.Sections['LegalEntities'] = @{
+        TotalCount  = if ($legalEntities) { @($legalEntities).Count } else { 0 }
+    }
+
+    # ── 7. FO Cleanup Batch Jobs (well-known names) ───────────────────────────
     # Check for standard FO cleanup jobs that should be scheduled.
     # Each entry includes the menu path and batch class so admins know exactly
     # where to set up any missing jobs.
@@ -260,22 +274,6 @@ function Collect-FOEnvironmentData {
                 MenuPath   = 'Data management workspace > Job history cleanup'
                 BatchClass = 'DMFExecutionHistoryCleanup'
                 Notes      = 'Older batch job name for DIXF staging cleanup. In current environments this job is named "Job history cleanup".'
-            },
-            @{
-                Pattern    = '*Clean up session*'
-                Purpose    = 'User session cleanup'
-                Category   = 'System'
-                MenuPath   = 'System administration > Periodic tasks > Clean up sessions'
-                BatchClass = 'SysUserSessionCleanup'
-                Notes      = 'Removes stale user session records from the database.'
-            },
-            @{
-                Pattern    = '*SysEmailBatchFlush*'
-                Purpose    = 'Email batch flush'
-                Category   = 'System'
-                MenuPath   = 'System administration > Periodic tasks > Email > Email distributor batch'
-                BatchClass = 'SysEmailBatchFlush'
-                Notes      = 'Processes and flushes the outbound email queue. Required for email delivery from D365FO.'
             }
         )
 
@@ -574,67 +572,151 @@ function Collect-FOEnvironmentData {
         # BatchJob exposes the user-entered description as JobDescription (not Description).
         $descriptionField = 'JobDescription'
 
-        $missingCleanup      = [System.Collections.Generic.List[hashtable]]::new()
-        $foundCleanup        = [System.Collections.Generic.List[hashtable]]::new()
-        $foundButAllDisabled = 0
-        $foundInErrorOnly    = 0
+        # ── Per-company analysis setup ───────────────────────────────────────
+        # System and DIXF cleanup jobs run cross-company. Everything else (Sales,
+        # Procurement, Warehouse, Inventory, Production, Master Planning, Finance,
+        # Retail) operates on company-scoped tables and must be scheduled in each
+        # legal entity. Build the set of LEs we expect coverage in: every
+        # collected LegalEntityId minus 'dat' (the default/admin company) minus
+        # anything listed in config/fo-skip-legal-entities.json.
+        $globalCategories = @('System', 'DIXF')
+
+        $skipLEs = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+        [void]$skipLEs.Add('dat')
+        try {
+            $skipLEPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'config\fo-skip-legal-entities.json'
+            if (Test-Path $skipLEPath) {
+                $skipCfg = Get-Content $skipLEPath -Raw | ConvertFrom-Json
+                foreach ($entry in @($skipCfg.SkipLegalEntities)) {
+                    if (-not $entry) { continue }
+                    # Allow either bare string or object with LegalEntityId field
+                    $id = if ($entry -is [string]) { $entry } else { [string]$entry.LegalEntityId }
+                    if ($id) { [void]$skipLEs.Add($id) }
+                }
+            }
+        } catch {
+            Write-InventoryLog "    Skip-LE config load failed: $($_.Exception.Message)" -Level WARN -Indent 2
+        }
+
+        # Build the list of LEs to check for company-specific coverage. The
+        # OData response sometimes serializes a single result as an object
+        # rather than an array, so normalise via @() first.
+        $allLEs = @()
+        if ($legalEntities) { $allLEs = @($legalEntities) }
+        $checkLEs = @($allLEs | Where-Object {
+            $_.LegalEntityId -and -not $skipLEs.Contains([string]$_.LegalEntityId)
+        })
+
+        $missingCleanup            = [System.Collections.Generic.List[hashtable]]::new()
+        $foundCleanup              = [System.Collections.Generic.List[hashtable]]::new()
+        $companySpecificResults    = [System.Collections.Generic.List[hashtable]]::new()
+        $foundButAllDisabled       = 0
+        $foundInErrorOnly          = 0
+        $companyJobsMissingAny     = 0
 
         foreach ($cj in $knownCleanupJobs) {
+            $isGlobal = $globalCategories -contains [string]$cj.Category
+
             $jobMatches = @($bjArr | Where-Object { $_.$descriptionField -like $cj.Pattern })
-            if ($jobMatches.Count -eq 0) {
-                $missingCleanup.Add(@{
-                    Pattern    = $cj.Pattern
-                    Purpose    = $cj.Purpose
-                    Category   = $cj.Category
-                    MenuPath   = $cj.MenuPath
-                    BatchClass = $cj.BatchClass
-                    Notes      = $cj.Notes
+
+            # ── Global (System / DIXF) ──────────────────────────────────────
+            if ($isGlobal) {
+                if ($jobMatches.Count -eq 0) {
+                    $missingCleanup.Add(@{
+                        Pattern    = $cj.Pattern
+                        Purpose    = $cj.Purpose
+                        Category   = $cj.Category
+                        MenuPath   = $cj.MenuPath
+                        BatchClass = $cj.BatchClass
+                        Notes      = $cj.Notes
+                    })
+                    continue
+                }
+
+                $matchedJobs   = [System.Collections.Generic.List[object]]::new()
+                $enabledCount  = 0
+                $errorCount    = 0
+                $disabledCount = 0
+
+                foreach ($m in $jobMatches) {
+                    $statusLabel = [string]$m.Status
+                    $isEnabled   = $enabledLabels -contains $statusLabel
+                    $isError     = $statusLabel -eq $errorLabel
+
+                    if ($isEnabled)    { $enabledCount++ }
+                    elseif ($isError)  { $errorCount++ }
+                    else               { $disabledCount++ }
+
+                    $matchedJobs.Add([ordered]@{
+                        BatchJobRecId  = $m.BatchJobRecId
+                        JobDescription = $m.JobDescription
+                        Status         = $statusLabel
+                        IsEnabled      = $isEnabled
+                        HasRecurrence  = [bool]$m.Recurrence
+                        StartDateTime  = $m.StartDateTime
+                        EndDateTime    = $m.EndDateTime
+                        CompanyAccounts = $m.CompanyAccounts
+                    })
+                }
+
+                if ($enabledCount -eq 0 -and $errorCount -eq 0) { $foundButAllDisabled++ }
+                elseif ($enabledCount -eq 0 -and $errorCount -gt 0) { $foundInErrorOnly++ }
+
+                $foundCleanup.Add(@{
+                    Pattern       = $cj.Pattern
+                    Purpose       = $cj.Purpose
+                    Category      = $cj.Category
+                    MenuPath      = $cj.MenuPath
+                    BatchClass    = $cj.BatchClass
+                    MatchCount    = $jobMatches.Count
+                    EnabledCount  = $enabledCount
+                    ErrorCount    = $errorCount
+                    DisabledCount = $disabledCount
+                    IsEnabled     = ($enabledCount -gt 0)
+                    MatchedJobs   = @($matchedJobs)
                 })
                 continue
             }
 
-            $matchedJobs   = [System.Collections.Generic.List[object]]::new()
-            $enabledCount  = 0
-            $errorCount    = 0
-            $disabledCount = 0
+            # ── Company-specific (everything except System / DIXF) ─────────
+            # Per-LE coverage check. A job counts as "scheduled" for LE X only
+            # if it: matches the pattern AND has CompanyAccounts == X (case
+            # insensitive) AND has Status in the enabled labels. Disabled or
+            # cancelled jobs are treated as missing per the project's spec.
+            $missingInLEs = [System.Collections.Generic.List[string]]::new()
+            $coveredInLEs = [System.Collections.Generic.List[string]]::new()
 
-            foreach ($m in $jobMatches) {
-                $statusLabel = [string]$m.Status
-                $isEnabled   = $enabledLabels -contains $statusLabel
-                $isError     = $statusLabel -eq $errorLabel
-
-                if ($isEnabled)    { $enabledCount++ }
-                elseif ($isError)  { $errorCount++ }
-                else               { $disabledCount++ }
-
-                $matchedJobs.Add([ordered]@{
-                    BatchJobRecId  = $m.BatchJobRecId
-                    JobDescription = $m.JobDescription
-                    Status         = $statusLabel
-                    IsEnabled      = $isEnabled
-                    HasRecurrence  = [bool]$m.Recurrence
-                    StartDateTime  = $m.StartDateTime
-                    EndDateTime    = $m.EndDateTime
-                    CompanyAccounts = $m.CompanyAccounts
-                })
+            foreach ($le in $checkLEs) {
+                $leId = [string]$le.LegalEntityId
+                $hasEnabledForLE = $false
+                foreach ($m in $jobMatches) {
+                    if ([string]$m.CompanyAccounts -and
+                        [string]$m.CompanyAccounts -ieq $leId -and
+                        $enabledLabels -contains [string]$m.Status) {
+                        $hasEnabledForLE = $true
+                        break
+                    }
+                }
+                if ($hasEnabledForLE) { $coveredInLEs.Add($leId) }
+                else                  { $missingInLEs.Add($leId) }
             }
 
-            if ($enabledCount -eq 0 -and $errorCount -eq 0) { $foundButAllDisabled++ }
-            elseif ($enabledCount -eq 0 -and $errorCount -gt 0) { $foundInErrorOnly++ }
-
-            $foundCleanup.Add(@{
-                Pattern       = $cj.Pattern
-                Purpose       = $cj.Purpose
-                Category      = $cj.Category
-                MenuPath      = $cj.MenuPath
-                BatchClass    = $cj.BatchClass
-                MatchCount    = $jobMatches.Count
-                EnabledCount  = $enabledCount
-                ErrorCount    = $errorCount
-                DisabledCount = $disabledCount
-                IsEnabled     = ($enabledCount -gt 0)
-                MatchedJobs   = @($matchedJobs)
-            })
+            $entry = @{
+                Pattern              = $cj.Pattern
+                Purpose              = $cj.Purpose
+                Category             = $cj.Category
+                MenuPath             = $cj.MenuPath
+                BatchClass           = $cj.BatchClass
+                Notes                = $cj.Notes
+                TotalCompaniesChecked = $checkLEs.Count
+                MissingInCompanies   = @($missingInLEs)
+                CoveredInCompanies   = @($coveredInLEs)
+                MatchCount           = $jobMatches.Count
+            }
+            $companySpecificResults.Add($entry)
+            if ($missingInLEs.Count -gt 0 -and $checkLEs.Count -gt 0) {
+                $companyJobsMissingAny++
+            }
         }
 
         # Group missing jobs by category for easier reporting
@@ -643,15 +725,19 @@ function Collect-FOEnvironmentData {
         } | Sort-Object Category
 
         $result.Sections['FOCleanupJobs'] = @{
-            TotalChecked          = $knownCleanupJobs.Count
-            MissingCount          = $missingCleanup.Count
-            FoundCount            = $foundCleanup.Count
-            FoundButAllDisabled   = $foundButAllDisabled
-            FoundInErrorOnly      = $foundInErrorOnly
-            MissingStandardJobs   = @($missingCleanup)
-            MissingByCategory     = @($missingByCategory)
-            FoundStandardJobs     = @($foundCleanup)
-            Notes                 = @(
+            TotalChecked              = $knownCleanupJobs.Count
+            MissingCount              = $missingCleanup.Count
+            FoundCount                = $foundCleanup.Count
+            FoundButAllDisabled       = $foundButAllDisabled
+            FoundInErrorOnly          = $foundInErrorOnly
+            MissingStandardJobs       = @($missingCleanup)
+            MissingByCategory         = @($missingByCategory)
+            FoundStandardJobs         = @($foundCleanup)
+            CompanySpecificCleanupJobs = @($companySpecificResults)
+            CompaniesChecked          = @($checkLEs | ForEach-Object { [string]$_.LegalEntityId })
+            CompaniesSkipped          = @($skipLEs | Sort-Object)
+            CompanyJobsMissingAny     = $companyJobsMissingAny
+            Notes                     = @(
                 if ($missingCleanup.Count -gt 0) {
                     "FO_MISSING_CLEANUP_JOBS ($($missingCleanup.Count) of $($knownCleanupJobs.Count) standard jobs not found)"
                 }
@@ -661,23 +747,20 @@ function Collect-FOEnvironmentData {
                 if ($foundInErrorOnly -gt 0) {
                     "FO_CLEANUP_JOBS_IN_ERROR ($foundInErrorOnly of $($foundCleanup.Count) found cleanup jobs are in Error state with no healthy replacement)"
                 }
+                if ($companyJobsMissingAny -gt 0 -and $checkLEs.Count -gt 0) {
+                    "FO_COMPANY_CLEANUP_JOBS_MISSING ($companyJobsMissingAny of $($companySpecificResults.Count) company-specific cleanup jobs are missing or disabled in at least one of $($checkLEs.Count) checked legal entities)"
+                }
             ) | Where-Object { $_ }
         }
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-missing-cleanup-jobs.json' -Data $missingCleanup
+        Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-company-specific-cleanup-jobs.json' -Data @($companySpecificResults)
         Save-EnvironmentData -EnvironmentDir $EnvOutputDir -FileName 'fo-cleanup-jobs-found.json'   -Data @($foundCleanup)
-        Write-InventoryLog "    -> $($foundCleanup.Count) found ($foundButAllDisabled disabled, $foundInErrorOnly in error); $($missingCleanup.Count) missing." -Level OK -Indent 3
-    }
-
-    # ── 7. FO Legal Entities ──────────────────────────────────────────────────
-    # $metadata: LegalEntity key is LegalEntityId. No Enabled/IsPrimary/IsVirtual
-    # field is exposed via OData — those only exist on the backing table.
-    $legalEntities = Invoke-FOOData `
-        -Path 'LegalEntities?$select=LegalEntityId,Name,CompanyCountry' `
-        -SectionLabel 'Legal Entities' `
-        -SaveFileName 'fo-legal-entities.json'
-
-    $result.Sections['LegalEntities'] = @{
-        TotalCount  = if ($legalEntities) { @($legalEntities).Count } else { 0 }
+        Write-InventoryLog "    -> Global: $($foundCleanup.Count) found ($foundButAllDisabled disabled, $foundInErrorOnly in error); $($missingCleanup.Count) missing." -Level OK -Indent 3
+        if ($checkLEs.Count -gt 0) {
+            Write-InventoryLog "    -> Per-company: $companyJobsMissingAny of $($companySpecificResults.Count) company-specific jobs missing in at least one of $($checkLEs.Count) checked LE(s) (skipping: $($skipLEs -join ', '))." -Level OK -Indent 3
+        } else {
+            Write-InventoryLog "    -> Per-company: skipped (no non-skipped legal entities present)." -Level OK -Indent 3
+        }
     }
 
     # ── 8. FO System Users ────────────────────────────────────────────────────

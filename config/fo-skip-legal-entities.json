@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Legal entities to skip when checking per-company F&O cleanup-job coverage.",
+    "Match is case-insensitive against LegalEntityId. The 'dat' default/admin",
+    "company is always skipped automatically and does NOT need to be listed here.",
+    "",
+    "Use this for LEs you do not actively operate in (acquisitions never used,",
+    "country setups created but dormant, historical companies kept for reporting).",
+    "Listed LEs are still collected into fo-legal-entities.json — they are only",
+    "excluded from the 'missing per-company cleanup job' check used by the",
+    "Storage Cleanup Recommendations section of the report.",
+    "",
+    "Entries can be either a bare LegalEntityId string, or an object with a",
+    "Note for documentation purposes (the Note is ignored by the script)."
+  ],
+  "SkipLegalEntities": [
+  ]
+}

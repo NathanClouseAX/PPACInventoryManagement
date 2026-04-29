@@ -1,8 +1,10 @@
 # PPAC Dataverse Inventory
 
-Read-only PowerShell toolkit for auditing every Power Platform / Dataverse environment in a Microsoft 365 tenant. Collects environment health, storage, governance posture, and operational data, then generates a self-contained interactive HTML report.
+PowerShell toolkit for auditing every Power Platform / Dataverse environment in a Microsoft 365 tenant. Collects environment health, storage, governance posture, and operational data, then generates a self-contained interactive HTML report.
 
-All operations are **read-only**. Nothing is modified in any environment.
+**Inventory + reporting are read-only.** `Invoke-DataverseInventory.ps1` and `Generate-Report.ps1` never modify any environment.
+
+An optional companion script, `Apply-DataverseRemediations.ps1`, can act on the report's recommendations by creating Bulk Delete jobs and changing org settings. It is **dry-run by default**, requires explicit per-environment opt-in, and only runs when you invoke it directly. See [Applying Remediations](#applying-remediations-optional) below.
 
 ---
 
@@ -41,6 +43,12 @@ cd C:\...\PPACInventoryManagement
 
 # Step 3: Generate the HTML report and open it
 .\scripts\Generate-Report.ps1 -DataPath .\data -OpenReport
+
+# Step 4 (OPTIONAL): Apply recommended cleanup as Bulk Delete jobs
+#   Dry-run is the default — nothing is created without -Apply.
+.\scripts\Apply-DataverseRemediations.ps1 `
+    -EnvironmentFilter '^my-sandbox$' `
+    -IncludeKind AllBulkDelete
 ```
 
 ---
@@ -88,6 +96,22 @@ cd C:\...\PPACInventoryManagement
 | `-DataPath` | `..\data` | Path to the collected data directory |
 | `-ReportPath` | `.\reports\PPACInventoryReport_<ts>.html` | Output path for the HTML report |
 | `-OpenReport` | `$false` | Open the report in the default browser after generation |
+
+In addition to the HTML report, `Generate-Report.ps1` writes `data/recommendations.json` — a machine-readable list of the cleanup recommendations consumed by `Apply-DataverseRemediations.ps1`.
+
+### `Apply-DataverseRemediations.ps1` (optional)
+
+Reads `data/recommendations.json` and creates Bulk Delete jobs / org-setting changes via the Dataverse Web API. **Dry-run by default** — pass `-Apply` to actually write.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-DataPath` | `..\data` | Root data directory containing `recommendations.json` |
+| `-EnvironmentFilter` | _(required)_ | **Regex** on environment DisplayName. There is intentionally no "apply to all" mode. |
+| `-IncludeKind` | _(required)_ | Allowlist of `RemediationKind` values. Special token `AllBulkDelete` expands to every `BulkDelete:*` kind. |
+| `-IncludeSettingChanges` | `$false` | Allow `Setting:*` kinds (e.g. flipping `plugintracelogsetting`). Off by default — settings flips are gated separately from Bulk Delete writes. |
+| `-Apply` | `$false` | Actually call Dataverse. Without this switch, the script prints a plan and writes a `DRY-RUN-*.json` audit file. |
+| `-IAcknowledgeProduction` | `$false` | Required when any matched env is `Sku=Production`. Acts as a manual brake. |
+| `-AuditPath` | `<DataPath>\remediations\<MODE>-<ts>.json` | Where to write the per-run audit JSON. |
 
 ---
 
@@ -306,6 +330,89 @@ Each recommendation includes:
 
 > **Tip**: Entity record counts are collected by default. If you're on a very large tenant and want a fast pass, disable them with `-IncludeEntityCounts:$false`.
 
+In addition to rendering recommendations into the HTML report, `Generate-Report.ps1` emits a structured `data/recommendations.json` keyed by environment. Each recommendation includes a `RemediationKind` (e.g. `BulkDelete:AsyncOps_Completed_90d`) and `RemediationParams` (e.g. `OlderThanDays=90`). Recommendations that can't be safely automated (audit retention changes, manual triage steps, F&O batch jobs) have `RemediationKind = null` and stay advisory-only.
+
+---
+
+## Applying Remediations (optional)
+
+`Apply-DataverseRemediations.ps1` reads `recommendations.json` and translates each actionable recommendation into a Dataverse Web API call: a recurring **Bulk Delete job** for cleanup recommendations, or a **PATCH against `organizations(<id>)`** for org-setting flips.
+
+This script is the only part of the toolkit that writes to a customer environment. It is opt-in across multiple dimensions:
+
+- **Dry-run is the default.** Without `-Apply`, no Dataverse API calls are made. The script prints the plan and writes a `DRY-RUN-*.json` audit file.
+- **`-EnvironmentFilter` is required.** A regex on `DisplayName`; there is no "apply to all" switch.
+- **`-IncludeKind` is required.** An explicit allowlist of `RemediationKind` values (or the shorthand `AllBulkDelete`).
+- **Production gate.** Any matched environment with `Sku=Production` aborts the run unless `-IAcknowledgeProduction` is also passed.
+- **Setting changes are gated separately.** `Setting:*` kinds require `-IncludeSettingChanges` in addition to being in the allowlist.
+- **Idempotent.** Created Bulk Delete jobs use stable names prefixed with `PPAC:`. Before each apply, the script probes `bulkdeleteoperations?$filter=name eq '<JobName>'` and skips if any rows already exist.
+- **Audited.** Every attempt — planned, applied, skipped, or failed — is recorded in `data/remediations/<MODE>-<UTC timestamp>.json` with the full request body and response.
+
+### Supported remediation kinds
+
+| Kind | Type | What it creates |
+|---|---|---|
+| `BulkDelete:AsyncOps_Completed_90d` | BulkDelete | Weekly: delete `asyncoperation` rows where `statecode=3` and `createdon` >90d ago |
+| `BulkDelete:AsyncOps_Failed_30d` | BulkDelete | Weekly: delete `asyncoperation` rows where `statuscode=31` (Failed) and `createdon` >30d ago |
+| `BulkDelete:AsyncOps_Suspended_30d` | BulkDelete | Weekly: delete `asyncoperation` rows where `statecode=1` (Suspended) and `createdon` >30d ago |
+| `BulkDelete:AsyncOps_Succeeded_30d` | BulkDelete | Weekly: delete `asyncoperation` rows where `statecode=3` AND `statuscode=30` and `createdon` >30d ago (cascade-cleans `WorkflowLog`) |
+| `BulkDelete:LargeAnnotations_365d` | BulkDelete | Monthly: delete `annotation` rows where `filesize>1048576` and `createdon` >365d ago |
+| `BulkDelete:OldCompletedEmails_90d` | BulkDelete | Weekly: delete `email` rows where `statecode=1` (Completed) and `actualend` >90d ago |
+| `BulkDelete:OldImportJobs_90d` | BulkDelete | Monthly: delete `asyncoperation` rows where `operationtype=1` (Import) and `createdon` >90d ago |
+| `BulkDelete:OldBulkDeleteOps_90d` | BulkDelete | Weekly: delete `asyncoperation` rows where `operationtype=13` (BulkDelete) AND `statuscode=30` and `createdon` >90d ago (self-cleaning) |
+| `Setting:DisablePluginTraceLog` | Setting | PATCH `organizations(<id>)` set `plugintracelogsetting=0` |
+
+All Bulk Delete schedules start at the next Saturday 02:00 UTC after the script runs.
+
+### Examples
+
+```powershell
+# 1. Plan only — see what would happen on one sandbox
+.\scripts\Apply-DataverseRemediations.ps1 `
+    -EnvironmentFilter '^my-sandbox$' `
+    -IncludeKind AllBulkDelete
+
+# 2. Apply against the sandbox after reviewing the dry-run
+.\scripts\Apply-DataverseRemediations.ps1 `
+    -EnvironmentFilter '^my-sandbox$' `
+    -IncludeKind AllBulkDelete `
+    -Apply
+
+# 3. Include the plugin-trace-log flip (different gate)
+.\scripts\Apply-DataverseRemediations.ps1 `
+    -EnvironmentFilter '^my-sandbox$' `
+    -IncludeKind AllBulkDelete,'Setting:DisablePluginTraceLog' `
+    -IncludeSettingChanges -Apply
+
+# 4. Production target — additional brake required
+.\scripts\Apply-DataverseRemediations.ps1 `
+    -EnvironmentFilter '^my-prod$' `
+    -IncludeKind 'BulkDelete:AsyncOps_Completed_90d' `
+    -Apply -IAcknowledgeProduction
+
+# 5. Cherry-pick specific kinds across multiple sandboxes
+.\scripts\Apply-DataverseRemediations.ps1 `
+    -EnvironmentFilter '^(uat|dm|gold)$' `
+    -IncludeKind 'BulkDelete:AsyncOps_Completed_90d','BulkDelete:LargeAnnotations_365d' `
+    -Apply
+```
+
+### Rolling back
+
+Every Bulk Delete job created by this script is a row in the `bulkdeleteoperation` table named with the `PPAC:` prefix. To cancel a recurring schedule:
+
+```http
+DELETE /api/data/v9.2/bulkdeleteoperations(<bulkdeleteoperationid>)
+```
+
+The audit JSON records the `JobId` returned by the BulkDelete action — that is the parent `asyncoperationid`, not the `bulkdeleteoperationid`. Look up the recurring series row by name:
+
+```http
+GET /api/data/v9.2/bulkdeleteoperations?$filter=name eq 'PPAC: AsyncOps Completed >90d'
+```
+
+Settings changes are reversed by a second run with the inverse value (e.g. flip `plugintracelogsetting` back to `1` (Exception) or `2` (All)) — there is currently no `Setting:RestorePluginTraceLog` kind, but you can issue the PATCH directly.
+
 ---
 
 ## Configuration Files
@@ -357,6 +464,23 @@ Optional metadata enrichment for F&O entity counts. When `-IncludeEntityCounts` 
 
 `Name` must be the public PascalCase Data Entity name exposed by the F&O AOS — **not** the underlying SQL table name.
 
+### `config/fo-skip-legal-entities.json`
+
+Legal entities to exclude from the per-company F&O cleanup-job coverage check. The collector treats System and DIXF cleanup jobs as global (one schedule covers the AOS) but every other category — Sales, Procurement, Warehouse, Inventory, Production, Master Planning, Finance, Retail — is company-scoped and must be scheduled in each operating legal entity. The collector iterates `LegalEntities` and for each cleanup catalog entry builds a `MissingInCompanies` list; the report renders this as a single rolled-up "F&O Per-Company Cleanup Gap" recommendation per catalog entry (priority scaled to the percentage of LEs missing coverage).
+
+`dat` (the default/admin company) is always skipped and does **not** need to be listed. Use this file to suppress noise from LEs you do not actively operate in — acquisitions never used, country setups created but dormant, historical companies kept only for reporting. Listed LEs are still collected into `fo-legal-entities.json`; they are only excluded from the missing-coverage check.
+
+```json
+{
+  "SkipLegalEntities": [
+    "USRT",
+    { "LegalEntityId": "GLSI", "Note": "decommissioned 2024 Q3" }
+  ]
+}
+```
+
+Match is case-insensitive against `LegalEntityId`. Entries can be either a bare string or an object with a `LegalEntityId` field (the optional `Note` is ignored by the script and exists only for documentation).
+
 ### `config/owners.json`
 
 Maps environment IDs to owner information. Populated automatically from Environment Admin role assignments during collection. You can manually override entries by setting `"AutoPopulated": false`.
@@ -404,12 +528,16 @@ data/
   environments.json              # All environments list (from BAP API)
   master-summary.json            # Cross-environment summary + all flags
   tenant-capacity.json           # Tenant-wide storage capacity
+  recommendations.json           # Machine-readable recommendations (input to Apply-DataverseRemediations.ps1)
   inventory.log                  # Structured collector log (Write-InventoryLog output, timestamped)
   logs/
     session-20260418-102354.log  # Full host transcript (prereqs + collector + report) — one file per run
   run-history/
     2025-04-01_120000.json       # Timestamped snapshots for delta reporting
     2025-04-08_120000.json
+  remediations/                  # (only after Apply-DataverseRemediations.ps1 has been run)
+    DRY-RUN-20260428_223254.json # One file per applier invocation; mode prefix = DRY-RUN | APPLY
+    APPLY-20260502_020005.json
   tenant/                        # (only with -IncludeGovernance) — tenant-scoped collection, runs once
     dlp-policies.json
     tenant-settings.json
@@ -509,7 +637,7 @@ reports/
 
 ## Notes
 
-- **Read-only**: no changes are made to any environment at any time.
+- **Read-only inventory + reporting**: `Invoke-DataverseInventory.ps1` and `Generate-Report.ps1` never modify any environment. The optional `Apply-DataverseRemediations.ps1` is the only script that can write — it is dry-run by default and requires explicit `-Apply`, `-EnvironmentFilter`, and `-IncludeKind` arguments to do anything. See [Applying Remediations](#applying-remediations-optional).
 - **Resume support**: re-run without `-Force` to skip already-collected environments and continue an interrupted run. Storage values always reflect the live BAP API data, even for skipped environments.
 - **FO detection**: F&O-integrated environments are identified authoritatively by calling the Dataverse `RetrieveFinanceAndOperationsIntegrationDetails` action, which also returns the F&O AOS URL, linked environment ID, and tenant ID. Detection runs on every environment with Dataverse; `-IncludeFO` only gates the deeper F&O AOS queries (batch jobs, DIXF, users, legal entities).
 - **Per-table storage**: Microsoft does not expose per-table byte-level storage via any public Dataverse or F&O API (the PPAC UI shows this, but the endpoint is undocumented). The report instead surfaces the **top 25 tables by record count** per environment (collected via the documented `RetrieveTotalRecordCount` function when `-IncludeEntityCounts` is used) as a storage-concentration proxy — tables with the most rows almost always dominate database storage.
